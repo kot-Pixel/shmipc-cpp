@@ -17,8 +17,9 @@ public:
     int  writData(const uint8_t* data, uint32_t len, int32_t timeout_ms = -1);
     bool isConnected() const;
 
-    void setOnConnected(std::function<void()> cb);
-    void setOnData(std::function<void(const void*, uint32_t)> cb);
+    void setOnConnected   (std::function<void()> cb);
+    void setOnData        (std::function<void(const void*, uint32_t)> cb);
+    void setOnDataZc      (std::function<void(shmipc_buf_t*)> cb);
     void setOnDisconnected(std::function<void()> cb);
 
     ShmClientSession* session() const { return mSession.get(); }

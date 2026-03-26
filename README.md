@@ -1,116 +1,136 @@
-# shmipc — 共享内存 IPC 库
+**Language:** English | [简体中文](README_zh-CN.md)
 
-基于共享内存（`memfd` + `mmap`）的高性能双向 IPC 框架，纯 C 公开 API，内部 C++11 实现，支持 Linux x86_64 与 Android arm64-v8a。
+# shmipc — Shared Memory IPC Library
 
----
+A high-performance, bidirectional IPC framework built on shared memory (`memfd` + `mmap`). Pure C public API, C++11 internals, supports Linux x86_64 and Android arm64-v8a.
 
-## 特性
-
-- **零拷贝传输** — 数据直接写入 mmap 映射的共享内存，无 socket 拷贝
-- **futex 通知** — 使用 `FUTEX_WAIT/WAKE` 替代 Unix Domain Socket 通知，减少上下文切换
-- **全双工** — server_write 与 client_write 各自独立 ring buffer，双向并发无竞争
-- **崩溃感知** — UDS 连接断开时自动触发 `on_disconnected` 回调并释放共享内存
-- **背压控制** — 写入时支持阻塞、非阻塞、定时三种模式
-- **三种预设** — LOW_FREQ / GENERAL / HIGH_THROUGHPUT，开箱即用
-- **C API** — 不暴露任何 C++ 符号，可直接从 C / JNI / FFI 调用
-- **小尺寸** — Android `.so` 约 420 KB（符号隐藏 + `-Os` + strip）
+> **One-sentence pitch:** A futex-driven, zero-copy shared-memory pipe with a clean C API, designed for high-throughput, low-latency local IPC on Linux and Android.
 
 ---
 
-## 目录结构
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **Zero-copy receive** | Single-slice messages borrow the SHM pointer directly — no heap copy in `on_data_zc` |
+| **Zero-copy write** | `alloc_buf` / `send_buf` lets callers fill SHM slices in-place, skipping the internal `memcpy` |
+| **futex notification** | `FUTEX_WAIT/WAKE` replaces Unix Domain Socket data signals, reducing context switches |
+| **Full-duplex** | Independent `server_write` / `client_write` ring buffers — no contention in either direction |
+| **Crash awareness** | UDS socket closure triggers `on_disconnected` and shared-memory cleanup automatically |
+| **Back-pressure** | Three write modes: blocking, non-blocking (drop), timed (up to N ms) |
+| **Async dispatch** | Optional decoupled dispatch thread so slow `on_data` callbacks never stall ring-buffer draining |
+| **Latency monitoring** | Per-session P50/P90/P99/P99.9 delivery-latency histograms with `get_latency` / `reset_latency` |
+| **Status API** | Real-time counters: bytes/messages sent & received, send-buffer fullness % |
+| **Three presets** | `LOW_FREQ` / `GENERAL` / `HIGH_THROUGHPUT` — ready to use out of the box |
+| **Pure C API** | No C++ symbols exposed; callable from C, JNI, FFI |
+| **Small footprint** | Android `.so` ≈ 420 KB (hidden symbols + `-Os` + strip) |
+
+---
+
+## Directory Layout
 
 ```
 shmipc/
 ├── include/shmipc/
-│   ├── shmipc.h          ← 唯一公开头文件（C API）
-│   └── ShmConfig.h       ← 内部配置宏（install 时同步安装）
-├── src/                  ← C++ 实现
+│   ├── shmipc.h          ← sole public header (C API)
+│   └── ShmConfig.h       ← internal config macros (installed alongside)
+├── src/                  ← C++ implementation
 ├── examples/
-│   ├── server_main.c     ← 示例：echo server
-│   └── client_main.c     ← 示例：echo client
+│   ├── server_main.c
+│   └── client_main.c
 ├── tests/
 │   ├── test_common.h
-│   ├── test1_s2c.c       ← Server→Client 基准
-│   ├── test2_c2s.c       ← Client→Server 基准
-│   └── test3_duplex.c    ← 全双工 / 多线程 / 混合模式
+│   ├── test1_s2c.c       ← Server→Client benchmark
+│   ├── test2_c2s.c       ← Client→Server benchmark
+│   ├── test3_duplex.c    ← Full-duplex / multi-thread / mixed modes
+│   ├── test4_zc.c        ← Zero-copy receive API validation
+│   ├── test5_latency.c   ← Latency monitoring API validation
+│   └── README.md
 ├── CMakeLists.txt
-└── install.sh            ← 一键打包 dist/
+└── install.sh            ← one-shot dist/ packager
 ```
 
 ---
 
-## 环境要求
+## Requirements
 
-| 组件 | 最低版本 | 说明 |
-|------|----------|------|
-| Linux 内核 | 4.14+ | `memfd_create`、`futex` |
+| Component | Minimum | Notes |
+|-----------|---------|-------|
+| Linux kernel | 4.14+ | `memfd_create`, `futex` |
 | CMake | 3.14+ | |
 | GCC / Clang | GCC 7+ / Clang 6+ | C++11 |
-| Android NDK | r21+ | arm64-v8a 交叉编译 |
+| Android NDK | r21+ | arm64-v8a cross-compilation |
 
-> 在 Windows 上请在 **WSL（Ubuntu 22.04）** 内构建。
+> On Windows, build inside **WSL (Ubuntu 22.04)**.
 
 ---
 
-## 构建
+## Building
 
-### 快速构建（本机 x86_64）
+### Quick build (host x86_64)
 
 ```bash
 cd shmipc
-cmake -S . -B build
-cmake --build build -j4
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
-构建产物：
-- `build/libshmipc.a` — 静态库
-- `build/shmipc_server`、`build/shmipc_client` — 示例程序（如开启）
-- `build/shmipc_test1_s2c`、`build/shmipc_test2_c2s`、`build/shmipc_test3_duplex` — 测试程序
+Outputs:
+- `build/libshmipc.a` — static library
+- `build/shmipc_server`, `build/shmipc_client` — example binaries
+- `build/shmipc_test1_s2c` … `build/shmipc_test5_latency` — test binaries
 
-### CMake 选项
+### CMake options
 
-| 选项 | 默认 | 说明 |
-|------|------|------|
-| `SHMIPC_BUILD_SHARED` | `OFF` | `ON` 构建 `.so`，`OFF` 构建 `.a` |
-| `SHMIPC_BUILD_EXAMPLES` | `ON` | 是否编译 examples/ |
-| `SHMIPC_BUILD_TESTS` | `ON` | 是否编译 tests/ |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SHMIPC_BUILD_SHARED` | `OFF` | `ON` builds `.so`, `OFF` builds `.a` |
+| `SHMIPC_BUILD_EXAMPLES` | `ON` | Build examples/ |
+| `SHMIPC_BUILD_TESTS` | `ON` | Build tests/ |
 
 ```bash
-# 构建共享库，不编译示例和测试
-cmake -S . -B build -DSHMIPC_BUILD_SHARED=ON -DSHMIPC_BUILD_EXAMPLES=OFF -DSHMIPC_BUILD_TESTS=OFF
-cmake --build build -j4
+# Shared library only, no examples or tests
+cmake -S . -B build -DSHMIPC_BUILD_SHARED=ON \
+      -DSHMIPC_BUILD_EXAMPLES=OFF -DSHMIPC_BUILD_TESTS=OFF
+cmake --build build -j$(nproc)
 ```
 
-### 构建 Debug 版本
+### Android arm64-v8a cross-compilation
 
 ```bash
-cmake -S . -B build_debug -DCMAKE_BUILD_TYPE=Debug
-cmake --build build_debug -j4
+cmake -S shmipc -B build_arm64 \
+    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-21 \
+    -DSHMIPC_BUILD_SHARED=ON \
+    -DSHMIPC_BUILD_EXAMPLES=OFF \
+    -DSHMIPC_BUILD_TESTS=OFF
+cmake --build build_arm64 -j$(nproc) --target shmipc
 ```
 
 ---
 
-## 打包发布（install.sh）
+## Packaging (`install.sh`)
 
-`install.sh` 一次性为 **x86_64** 和 **arm64-v8a** 构建库，并输出可直接集成的 `dist/` 目录。
+Builds for both x86_64 and arm64-v8a and produces an integration-ready `dist/` tree.
 
 ```bash
-# 在 shmipc/ 目录下执行（WSL 内）
-bash install.sh                  # 共享库（默认）
-bash install.sh --static         # 静态库
-bash install.sh --skip-arm64     # 仅 x86_64
-bash install.sh --skip-x86       # 仅 arm64-v8a
+# Run inside shmipc/ (WSL)
+bash install.sh                  # shared library (default)
+bash install.sh --static         # static library
+bash install.sh --skip-arm64     # x86_64 only
+bash install.sh --skip-x86       # arm64-v8a only
 ```
 
-**环境变量：**
+**Environment variables:**
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `ANDROID_NDK_HOME` | `~/android-ndk-r28b` | NDK 根目录 |
-| `DIST` | `./dist` | 输出目录 |
-| `BUILD_TYPE` | `Release` | `Release` 或 `Debug` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANDROID_NDK_HOME` | `~/android-ndk-r28b` | NDK root |
+| `DIST` | `./dist` | Output directory |
+| `BUILD_TYPE` | `Release` | `Release` or `Debug` |
 
-**输出结构：**
+**Output layout:**
 
 ```
 dist/
@@ -126,187 +146,158 @@ dist/
 
 ---
 
-## API 参考
+## API Reference
 
-### 配置预设
+### Configuration presets
 
 ```c
 #include "shmipc/shmipc.h"
 
-// 直接使用内置预设（推荐）
-SHMIPC_CONFIG_LOW_FREQ        // shm=8MB,  queue=32,  slice=4KB   — 低频控制消息
-SHMIPC_CONFIG_GENERAL         // shm=16MB, queue=64,  slice=16KB  — 通用 IPC（默认）
-SHMIPC_CONFIG_HIGH_THROUGHPUT // shm=64MB, queue=256, slice=64KB  — 高吞吐视频/音频
+SHMIPC_CONFIG_LOW_FREQ        // shm=8MB,  queue=32,  slice=4KB   — low-frequency control
+SHMIPC_CONFIG_GENERAL         // shm=16MB, queue=64,  slice=16KB  — general IPC (default)
+SHMIPC_CONFIG_HIGH_THROUGHPUT // shm=64MB, queue=256, slice=64KB  — video / audio streams
 
-// 或自定义
+// Custom config
 shmipc_config_t cfg = { .shm_size = 32u<<20, .event_queue_capacity = 128, .slice_size = 32768 };
 ```
 
-**单次写入最大数据量：**
+**Maximum single-write payload:**
 
-| 预设 | 最大单次写入 |
-|------|------------|
+| Preset | Max payload |
+|--------|-------------|
 | LOW_FREQ | ~4 MB |
 | GENERAL | ~8 MB |
 | HIGH_THROUGHPUT | ~32 MB |
 
-> 内部实现：`shm_size / 2` 为单侧 ring buffer，最大单次写约等于 buffer 总大小的一半。
+### Write timeout semantics
 
----
-
-### 写超时语义
-
-| `timeout_ms` 值 | 宏 | 行为 |
-|----------------|-----|------|
-| `-1` | `SHMIPC_TIMEOUT_NONBLOCKING` | buffer 满立即返回，丢弃本次写入 |
-| `0` | `SHMIPC_TIMEOUT_INFINITE` | 阻塞直到 buffer 有空间 |
-| `N > 0` | — | 最多等待 N 毫秒，超时返回 `SHMIPC_TIMEOUT` |
-
----
+| `timeout_ms` | Macro | Behaviour |
+|-------------|-------|-----------|
+| `-1` | `SHMIPC_TIMEOUT_NONBLOCKING` | Drop immediately if buffer full |
+| `0` | `SHMIPC_TIMEOUT_INFINITE` | Block until space is available |
+| `N > 0` | — | Wait at most N ms; returns `SHMIPC_TIMEOUT` |
 
 ### Server API
 
 ```c
-// 创建 / 销毁
 shmipc_server_t* shmipc_server_create(void);
 void             shmipc_server_destroy(shmipc_server_t* server);
 
-// 设置共享上下文（每个回调均可收到）
-void shmipc_server_set_context(shmipc_server_t* server, void* ctx);
+void shmipc_server_set_context(shmipc_server_t*, void* ctx);
 
-// 注册回调
-void shmipc_server_register_on_connected   (shmipc_server_t*, shmipc_on_session_cb    cb);
-void shmipc_server_register_on_data        (shmipc_server_t*, shmipc_on_data_cb        cb);
-void shmipc_server_register_on_disconnected(shmipc_server_t*, shmipc_on_disconnect_cb  cb);
+// Callbacks
+void shmipc_server_register_on_connected   (shmipc_server_t*, shmipc_on_session_cb);
+void shmipc_server_register_on_data        (shmipc_server_t*, shmipc_on_data_cb);
+void shmipc_server_register_on_data_zc     (shmipc_server_t*, shmipc_on_data_zc_cb);   // zero-copy receive
+void shmipc_server_register_on_disconnected(shmipc_server_t*, shmipc_on_disconnect_cb);
 
-// 生命周期
-int  shmipc_server_start(shmipc_server_t* server, const char* channel_name);
-void shmipc_server_stop (shmipc_server_t* server);
+int  shmipc_server_start(shmipc_server_t*, const char* channel_name);
+void shmipc_server_stop (shmipc_server_t*);
 
-// 向指定 session（客户端）发送数据
-int shmipc_session_write(shmipc_session_t* session, const void* data, uint32_t len,
-                         int32_t timeout_ms);
+// Write to a specific client
+int  shmipc_session_write(shmipc_session_t*, const void* data, uint32_t len, int32_t timeout_ms);
 
-// 状态查询
-void shmipc_server_get_status (shmipc_server_t*,  shmipc_server_status_t*  out);
-void shmipc_session_get_status(shmipc_session_t*, shmipc_session_status_t* out);
+// Write-side zero-copy (single-slice, len <= slice_size)
+shmipc_wbuf_t* shmipc_session_alloc_buf   (shmipc_session_t*, uint32_t len);
+int            shmipc_session_send_buf    (shmipc_session_t*, shmipc_wbuf_t*, uint32_t len);
+void           shmipc_session_discard_buf (shmipc_session_t*, shmipc_wbuf_t*);
+
+// Status & latency
+void shmipc_server_get_status  (shmipc_server_t*,  shmipc_server_status_t*);
+void shmipc_session_get_status (shmipc_session_t*, shmipc_session_status_t*);
+void shmipc_session_get_latency(shmipc_session_t*, shmipc_latency_stats_t*);
+void shmipc_session_reset_latency(shmipc_session_t*);
+
+// Async dispatch (decouple slow callbacks from ring-buffer draining)
+void shmipc_server_set_async_dispatch(shmipc_server_t*, uint32_t queue_depth);
 ```
-
----
 
 ### Client API
 
 ```c
-// 创建 / 销毁
 shmipc_client_t* shmipc_client_create(void);
-void             shmipc_client_destroy(shmipc_client_t* client);
+void             shmipc_client_destroy(shmipc_client_t*);
 
-// 设置共享上下文
-void shmipc_client_set_context(shmipc_client_t* client, void* ctx);
+void shmipc_client_set_context(shmipc_client_t*, void* ctx);
+void shmipc_client_set_config (shmipc_client_t*, const shmipc_config_t*);
 
-// 覆盖 channel 配置（必须在 connect 前调用；不调用则使用 GENERAL）
-void shmipc_client_set_config(shmipc_client_t* client, const shmipc_config_t* config);
+// Callbacks
+void shmipc_client_register_on_connected   (shmipc_client_t*, shmipc_on_session_cb);
+void shmipc_client_register_on_data        (shmipc_client_t*, shmipc_on_data_cb);
+void shmipc_client_register_on_data_zc     (shmipc_client_t*, shmipc_cli_on_data_zc_cb);
+void shmipc_client_register_on_disconnected(shmipc_client_t*, shmipc_on_disconnect_cb);
 
-// 注册回调
-void shmipc_client_register_on_connected   (shmipc_client_t*, shmipc_on_session_cb    cb);
-void shmipc_client_register_on_data        (shmipc_client_t*, shmipc_on_data_cb        cb);
-void shmipc_client_register_on_disconnected(shmipc_client_t*, shmipc_on_disconnect_cb  cb);
+int  shmipc_client_connect   (shmipc_client_t*, const char* channel_name);
+void shmipc_client_disconnect(shmipc_client_t*);
 
-// 生命周期
-int  shmipc_client_connect   (shmipc_client_t* client, const char* channel_name);
-void shmipc_client_disconnect(shmipc_client_t* client);
+int  shmipc_client_write(shmipc_client_t*, const void* data, uint32_t len, int32_t timeout_ms);
 
-// 向 server 发送数据
-int shmipc_client_write(shmipc_client_t* client, const void* data, uint32_t len,
-                        int32_t timeout_ms);
+// Write-side zero-copy
+shmipc_wbuf_t* shmipc_client_alloc_buf   (shmipc_client_t*, uint32_t len);
+int            shmipc_client_send_buf    (shmipc_client_t*, shmipc_wbuf_t*, uint32_t len);
+void           shmipc_client_discard_buf (shmipc_client_t*, shmipc_wbuf_t*);
 
-// 状态查询
-void shmipc_client_get_status(shmipc_client_t* client, shmipc_client_status_t* out);
+// Status & latency
+void shmipc_client_get_status  (shmipc_client_t*, shmipc_client_status_t*);
+void shmipc_client_get_latency (shmipc_client_t*, shmipc_latency_stats_t*);
+void shmipc_client_reset_latency(shmipc_client_t*);
+
+// Async dispatch
+void shmipc_client_set_async_dispatch(shmipc_client_t*, uint32_t queue_depth);
 ```
 
----
-
-### 状态结构体
+### Zero-copy receive buffer
 
 ```c
-// shmipc_server_get_status() 返回
-typedef struct {
-    int      is_running;        // 1 = 正在监听
-    uint32_t connected_clients; // 当前连接数
-} shmipc_server_status_t;
+const void* shmipc_buf_data   (const shmipc_buf_t* buf);
+uint32_t    shmipc_buf_len    (const shmipc_buf_t* buf);
+void        shmipc_buf_release(shmipc_buf_t* buf);   // MUST be called exactly once
+```
 
-// shmipc_session_get_status() 返回（服务端针对某个客户端）
-typedef struct {
-    int      is_alive;              // 1 = 连接存活
-    uint64_t bytes_sent;            // 服务端→客户端 字节数
-    uint64_t msgs_sent;             // 服务端→客户端 消息数
-    uint64_t bytes_received;        // 客户端→服务端 字节数
-    uint64_t msgs_received;         // 客户端→服务端 消息数
-    uint32_t send_buffer_used_pct;  // 服务端发送 buffer 占用率 (0-100)
-} shmipc_session_status_t;
+### Latency stats
 
-// shmipc_client_get_status() 返回
+```c
 typedef struct {
-    int      is_connected;
-    uint64_t bytes_sent;
-    uint64_t msgs_sent;
-    uint64_t bytes_received;
-    uint64_t msgs_received;
-    uint32_t send_buffer_used_pct;  // 客户端发送 buffer 占用率 (0-100)
-} shmipc_client_status_t;
+    uint64_t count;    // total messages sampled
+    uint64_t min_ns;   // minimum latency (ns)
+    uint64_t avg_ns;   // mean latency (ns)
+    uint64_t p50_ns;   // 50th percentile (ns)
+    uint64_t p90_ns;   // 90th percentile (ns)
+    uint64_t p99_ns;   // 99th percentile (ns)
+    uint64_t p999_ns;  // 99.9th percentile (ns)
+    uint64_t max_ns;   // maximum latency (ns)
+} shmipc_latency_stats_t;
 ```
 
 ---
 
-## 快速上手
+## Quick-Start Examples
 
-### Server 端
+### Server (echo)
 
 ```c
 #include "shmipc/shmipc.h"
 
-typedef struct { int id; } MyCtx;
-
-static void on_connected(shmipc_session_t* s, void* ctx) {
-    printf("client connected\n");
-}
-
 static void on_data(shmipc_session_t* s, const void* data, uint32_t len, void* ctx) {
-    // 收到数据后回写（echo）
     shmipc_session_write(s, data, len, SHMIPC_TIMEOUT_INFINITE);
 }
 
-static void on_disconnected(shmipc_session_t* s, void* ctx) {
-    printf("client disconnected\n");
-}
-
 int main(void) {
-    MyCtx ctx = { .id = 1 };
-
     shmipc_server_t* srv = shmipc_server_create();
-    shmipc_server_set_context(srv, &ctx);
-    shmipc_server_register_on_connected   (srv, on_connected);
-    shmipc_server_register_on_data        (srv, on_data);
-    shmipc_server_register_on_disconnected(srv, on_disconnected);
+    shmipc_server_register_on_data(srv, on_data);
 
-    if (shmipc_server_start(srv, "my_channel") != SHMIPC_OK) {
-        shmipc_server_destroy(srv);
-        return 1;
-    }
-
-    // 主循环...
-    pause();
+    shmipc_server_start(srv, "my_channel");
+    pause();  // run forever
 
     shmipc_server_stop(srv);
     shmipc_server_destroy(srv);
 }
 ```
 
-### Client 端
+### Client
 
 ```c
 #include "shmipc/shmipc.h"
-#include <string.h>
 
 static void on_data(shmipc_session_t* s, const void* data, uint32_t len, void* ctx) {
     printf("recv %u bytes\n", len);
@@ -314,58 +305,94 @@ static void on_data(shmipc_session_t* s, const void* data, uint32_t len, void* c
 
 int main(void) {
     shmipc_client_t* cli = shmipc_client_create();
-
-    // 可选：指定非默认预设
-    shmipc_client_set_config(cli, &SHMIPC_CONFIG_HIGH_THROUGHPUT);
-
     shmipc_client_register_on_data(cli, on_data);
 
-    if (shmipc_client_connect(cli, "my_channel") != SHMIPC_OK) {
-        shmipc_client_destroy(cli);
-        return 1;
-    }
+    shmipc_client_connect(cli, "my_channel");
 
     const char* msg = "hello";
-    // 阻塞写（等待 buffer 有空间）
-    shmipc_client_write(cli, msg, strlen(msg), SHMIPC_TIMEOUT_INFINITE);
-
-    // 非阻塞写（buffer 满则立即丢弃）
-    shmipc_client_write(cli, msg, strlen(msg), SHMIPC_TIMEOUT_NONBLOCKING);
-
-    // 超时写（最多等 100ms）
-    int rc = shmipc_client_write(cli, msg, strlen(msg), 100);
-    if (rc == SHMIPC_TIMEOUT) { /* 超时处理 */ }
+    shmipc_client_write(cli, msg, 5, SHMIPC_TIMEOUT_INFINITE);  // blocking write
 
     shmipc_client_disconnect(cli);
     shmipc_client_destroy(cli);
 }
 ```
 
-### 查询状态
+### Zero-copy receive (`on_data_zc`)
 
 ```c
-shmipc_client_status_t st;
-shmipc_client_get_status(cli, &st);
-printf("connected=%d  sent=%llu msgs  buf=%u%%\n",
-       st.is_connected, (unsigned long long)st.msgs_sent, st.send_buffer_used_pct);
+static void on_data_zc(shmipc_session_t* s, shmipc_buf_t* buf, void* ctx) {
+    const void* data = shmipc_buf_data(buf);
+    uint32_t    len  = shmipc_buf_len(buf);
+    // process data ...
+    shmipc_buf_release(buf);   // MUST be called
+}
+
+shmipc_server_register_on_data_zc(srv, on_data_zc);
+```
+
+### Write-side zero-copy (`alloc_buf` / `send_buf`)
+
+```c
+// Avoids the internal memcpy for single-slice messages (len <= slice_size)
+shmipc_wbuf_t* wb = shmipc_session_alloc_buf(session, 1024);
+if (wb) {
+    memcpy(shmipc_wbuf_data(wb), my_data, 1024);
+    shmipc_session_send_buf(session, wb, 1024);  // wb is consumed; do not use after
+}
+```
+
+### Latency monitoring
+
+```c
+// Periodic monitoring window
+shmipc_client_reset_latency(cli);
+sleep(60);
+shmipc_latency_stats_t st;
+shmipc_client_get_latency(cli, &st);
+printf("p50=%.1f µs  p99=%.1f µs  max=%.1f µs\n",
+       st.p50_ns/1e3, st.p99_ns/1e3, st.max_ns/1e3);
+```
+
+### Async dispatch
+
+```c
+// Prevent slow on_data from stalling the ring-buffer consumer
+shmipc_server_set_async_dispatch(srv, 256);   // 256-slot queue, dedicated thread
+shmipc_server_start(srv, "my_channel");
 ```
 
 ---
 
-## 集成到 Android 项目
-
-### 使用 install.sh 打包
+## Running Tests
 
 ```bash
-# 在 WSL 内
-export ANDROID_NDK_HOME=~/android-ndk-r28b
-bash install.sh          # 生成 dist/
+cd shmipc/build
+./shmipc_test1_s2c    2>/dev/null   # Server→Client throughput
+./shmipc_test2_c2s    2>/dev/null   # Client→Server throughput
+./shmipc_test3_duplex 2>/dev/null   # Full-duplex + multi-thread + mixed modes
+./shmipc_test4_zc     2>/dev/null   # Zero-copy receive API
+./shmipc_test5_latency              # Latency monitoring API
 ```
 
-### Android CMakeLists.txt
+Exit code `0` = all PASS, `1` = failure. See [`shmipc/tests/README.md`](shmipc/tests/README.md) for detailed descriptions.
+
+### Performance reference (i5-12400, WSL2 Ubuntu 22.04)
+
+| Scenario | Throughput |
+|----------|-----------|
+| 1 thread, 1 MB payload, BLOCK | ~1.5 GB/s |
+| 8 threads, 1 MB payload, BLOCK | ~5.7 GB/s |
+| 1 thread, 64 KB payload | ~1.1 GB/s |
+| Full-duplex, 1 MB ↔ 4 KB, 8 threads | S→C ~6 GB/s, C→S ~0.4 GB/s |
+| S→C delivery latency (1 KB, GENERAL) | p50 ≈ 1.5 µs, p99 ≈ 12 µs |
+
+---
+
+## Android Integration
+
+### Using the prebuilt `dist/`
 
 ```cmake
-# 导入预编译的 shmipc .so
 add_library(shmipc SHARED IMPORTED)
 set_target_properties(shmipc PROPERTIES
     IMPORTED_LOCATION
@@ -373,52 +400,17 @@ set_target_properties(shmipc PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES
         "${CMAKE_CURRENT_SOURCE_DIR}/dist/include"
 )
-
-# 链接到你的目标
 target_link_libraries(my_native_lib PRIVATE shmipc)
 ```
 
-### 从源码交叉编译
-
-```bash
-cmake -S shmipc -B build_arm64 \
-    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-    -DANDROID_ABI=arm64-v8a \
-    -DANDROID_PLATFORM=android-21 \
-    -DSHMIPC_BUILD_SHARED=ON \
-    -DSHMIPC_BUILD_EXAMPLES=OFF \
-    -DSHMIPC_BUILD_TESTS=OFF
-cmake --build build_arm64 -j4 --target shmipc
-```
-
 ---
 
-## 运行测试
+## Notes
 
-```bash
-cd shmipc/build
-./shmipc_test1_s2c  2>/dev/null   # Server→Client 单向
-./shmipc_test2_c2s  2>/dev/null   # Client→Server 单向
-./shmipc_test3_duplex 2>/dev/null  # 全双工 + 多线程 + 混合模式
-```
-
-退出码 `0` = 全部 PASS，`1` = 有 FAIL。详细测试说明见 [`tests/README.md`](tests/README.md)。
-
-### 性能参考（i5-12400，WSL2）
-
-| 场景 | 吞吐量 |
-|------|--------|
-| 单线程，1MB 负载，BLOCK | ~1.5 GB/s |
-| 8 线程，1MB 负载，BLOCK | ~7 GB/s |
-| 单线程，64KB 负载 | ~1.1 GB/s |
-| 全双工，1MB ↔ 4KB，8 线程 | S→C ~6 GB/s，C→S ~0.4 GB/s |
-
----
-
-## 注意事项
-
-- **单进程内勿多线程并发写同一 session/client**：写锁在库内部，并发写是安全的，但多线程竞争同一写锁在 NONBLK 模式下会导致大量丢弃。
-- **数据回调在专属线程内执行**，不要在回调中做耗时操作（建议拷贝数据后异步处理）。
-- **`on_connected` 触发后 session 才可写**，不要在 `shmipc_server_start` 返回后立即写数据。
-- **channel_name** 作为 Unix Domain Socket 路径前缀，长度建议 ≤ 32 字符，仅使用字母/数字/下划线。
-- Android 上需确保 `/dev/shm` 可访问（或使用 `memfd_create`，已内置支持，API level 21+）。
+- **Concurrent writes are safe**, but NONBLOCKING writers on the same session may drop messages under contention. Use per-thread sessions for the best throughput.
+- **`on_data` / `on_data_zc` run on the consumer thread.** For slow processing, enable `set_async_dispatch` or copy data and process asynchronously.
+- **`on_connected` must fire before writing** — do not write inside `shmipc_server_start` / `shmipc_client_connect`; wait for the callback.
+- **`on_data_zc` takes priority** over `on_data` when both are registered.
+- **`shmipc_buf_release` must be called exactly once** for every `shmipc_buf_t*` received via `on_data_zc`.
+- **`alloc_buf` / `send_buf` always consume the handle** — never use the pointer after calling either function.
+- `channel_name` is a Unix Domain Socket abstract namespace path. Keep it ≤ 32 characters (letters, digits, underscores).

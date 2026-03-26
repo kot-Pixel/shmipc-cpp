@@ -253,8 +253,8 @@ void ShmClientSession::handleShareMemoryReady() {
          mClientWriteBuf->io_queue.capacity, mClientWriteBuf->buffer_list.slice_count,
          mClientWriteBuf->buffer_list.slice_size);
 
-    /* Start the futex-based consumer thread for the server_write region now
-     * that mServerWriteBuf is valid. */
+    if (mAsyncDispatchDepth > 0) startDispatch();
+
     mConsumerRunning.store(true, std::memory_order_release);
     mServerWriteConsumerThread.reset(
         new std::thread(&ShmClientSession::serverWriteConsumerThread, this));
@@ -268,6 +268,10 @@ void ShmClientSession::handleShareMemoryReady() {
 
 void ShmClientSession::readFromServerWriteBuffer() {
     if (!mServerWriteBuf) return;
+    const bool hasZc       = static_cast<bool>(mOnDataZc);
+    const bool hasData     = static_cast<bool>(mOnData);
+    const bool hasDispatch = (mDispatchQueue != nullptr);
+    if (!hasZc && !hasData) return;
 
     auto*    queue = &mServerWriteBuf->io_queue;
     auto*    list  = &mServerWriteBuf->buffer_list;
@@ -276,39 +280,34 @@ void ShmClientSession::readFromServerWriteBuffer() {
     uint32_t head = queue->head.load(std::memory_order_acquire);
     uint32_t tail = queue->tail.load(std::memory_order_acquire);
 
-    /* do-while guarantees we re-check the queue after clearing workingFlags,
-     * closing the window where a producer sees flag=1 and skips the SyncEvent
-     * notification while we are about to stop draining. */
     do {
         while (head != tail) {
             ShmBufferEvent& event = queue->events[head % cap];
             uint32_t slice_index  = event.slice_index;
             uint32_t total_len    = event.length;
+            uint64_t latency_ns   = shm_now_ns() - event.write_ts_ns;
 
             if (slice_index != INVALID_INDEX) {
-                std::vector<uint8_t> out;
-                out.reserve(total_len);
-                uint32_t remaining = total_len;
-                uint32_t idx       = slice_index;
+                mRecvLatency.record(latency_ns);
+                mBytesReceived.fetch_add(total_len, std::memory_order_relaxed);
+                mMsgsReceived .fetch_add(1,         std::memory_order_relaxed);
 
-                while (idx != INVALID_INDEX && remaining > 0) {
-                    ShmBufferSlice* s    = get_slice(list, idx);
-                    uint8_t*        data = get_slice_data(s);
-                    uint32_t        copy = std::min(remaining, s->length);
-                    out.insert(out.end(), data, data + copy);
-                    remaining -= copy;
-                    idx = s->next;
-                }
+                shmipc_buf_t* buf = shmipc_buf_decode(
+                    list, slice_index, total_len, /*want_borrow=*/hasZc);
 
-                mBytesReceived.fetch_add(out.size(), std::memory_order_relaxed);
-                mMsgsReceived .fetch_add(1,          std::memory_order_relaxed);
-                if (mOnData) mOnData(out.data(), out.size());
-
-                idx = slice_index;
-                while (idx != INVALID_INDEX) {
-                    uint32_t next = get_slice(list, idx)->next;
-                    free_slice(list, idx);
-                    idx = next;
+                if (hasDispatch) {
+                    while (!mDispatchQueue->try_push(buf)) {
+                        if (!mConsumerRunning.load(std::memory_order_acquire)) {
+                            shmipc_buf_free(buf);
+                            goto done;
+                        }
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+                } else if (hasZc) {
+                    mOnDataZc(buf);
+                } else {
+                    mOnData(buf->data, buf->len);
+                    shmipc_buf_free(buf);
                 }
             }
 
@@ -317,12 +316,11 @@ void ShmClientSession::readFromServerWriteBuffer() {
             tail = queue->tail.load(std::memory_order_acquire);
         }
 
-        /* Clear the working flag, then re-sample to catch any events that
-         * arrived between our last tail-check and the flag clear. */
         queue->workingFlags.fetch_and(~WORKING_FLAG, std::memory_order_release);
         head = queue->head.load(std::memory_order_acquire);
         tail = queue->tail.load(std::memory_order_acquire);
     } while (head != tail);
+    done:;
 }
 
 bool ShmClientSession::tryWriteOnce(const uint8_t* data, uint32_t len) {
@@ -371,8 +369,9 @@ bool ShmClientSession::tryWriteOnce(const uint8_t* data, uint32_t len) {
         return false;
     }
 
-    queue->events[tail].slice_index = first;
-    queue->events[tail].length      = len;
+    queue->events[tail].slice_index  = first;
+    queue->events[tail].length       = len;
+    queue->events[tail].write_ts_ns  = shm_now_ns();
     queue->tail.store(next_tail, std::memory_order_release);
 
     uint32_t prev_flags = queue->workingFlags.fetch_or(WORKING_FLAG, std::memory_order_acq_rel);
@@ -437,11 +436,88 @@ void ShmClientSession::serverWriteConsumerThread() {
 
 void ShmClientSession::stopServerWriteConsumer() {
     mConsumerRunning.store(false, std::memory_order_release);
-    /* Wake the sleeping consumer thread so it can observe mConsumerRunning. */
     if (mServerWriteBuf)
         shm_futex_wake(&mServerWriteBuf->io_queue.workingFlags, INT_MAX);
     if (mServerWriteConsumerThread && mServerWriteConsumerThread->joinable())
         mServerWriteConsumerThread->join();
+    stopDispatch();
+}
+
+/* ── Async dispatch ──────────────────────────────────────────────── */
+
+void ShmClientSession::startDispatch() {
+    mDispatchQueue.reset(new ShmDispatchQueue(mAsyncDispatchDepth));
+    mDispatchThread.reset(new std::thread(&ShmClientSession::dispatchLoop, this));
+    LOGI("ShmClientSession async dispatch started (depth=%u)", mAsyncDispatchDepth);
+}
+
+void ShmClientSession::stopDispatch() {
+    if (mDispatchQueue) mDispatchQueue->stop();
+    if (mDispatchThread && mDispatchThread->joinable()) mDispatchThread->join();
+    mDispatchThread.reset();
+    mDispatchQueue.reset();
+}
+
+void ShmClientSession::dispatchLoop() {
+    while (auto* buf = mDispatchQueue->pop()) {
+        if (mOnDataZc) {
+            mOnDataZc(buf);
+        } else if (mOnData) {
+            mOnData(buf->data, buf->len);
+            shmipc_buf_free(buf);
+        } else {
+            shmipc_buf_free(buf);
+        }
+    }
+}
+
+/* ── Write-side zero-copy ────────────────────────────────────────── */
+
+shmipc_wbuf_t* ShmClientSession::allocWriteBuf(uint32_t len) {
+    if (!mClientWriteBuf || !mConnected) return nullptr;
+    auto* list = &mClientWriteBuf->buffer_list;
+    if (len == 0 || len > list->slice_size) return nullptr;
+
+    uint32_t idx = alloc_slice(list);
+    if (idx == INVALID_INDEX) return nullptr;
+
+    auto* wb      = new shmipc_wbuf_t;
+    wb->data      = get_slice_data(get_slice(list, idx));
+    wb->capacity  = list->slice_size;
+    wb->slice_idx = idx;
+    wb->manager   = mClientWriteBuf;
+    return wb;
+}
+
+int ShmClientSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
+    if (!buf) return SHMIPC_ERR;
+    if (!mClientWriteBuf || !mConnected || len == 0 || len > buf->capacity) {
+        discardWriteBuf(buf); return SHMIPC_ERR;
+    }
+
+    ShmBufferSlice* s = get_slice(&buf->manager->buffer_list, buf->slice_idx);
+    s->length = len;
+    s->next   = INVALID_INDEX;
+
+    bool ok;
+    {
+        std::lock_guard<std::mutex> g(mWriteMutex);
+        ok = shm_queue_commit(&mClientWriteBuf->io_queue, buf->slice_idx, len);
+    }
+
+    if (!ok) free_slice(&mClientWriteBuf->buffer_list, buf->slice_idx);
+    else { mBytesSent.fetch_add(len,std::memory_order_relaxed);
+           mMsgsSent .fetch_add(1,  std::memory_order_relaxed); }
+    delete buf;
+
+    if (ok) { notifyServerOfClientWrite(); return SHMIPC_OK; }
+    return SHMIPC_ERR;
+}
+
+void ShmClientSession::discardWriteBuf(shmipc_wbuf_t* buf) {
+    if (!buf) return;
+    if (buf->manager) free_slice(&buf->manager->buffer_list, buf->slice_idx);
+    delete buf;
 }
 
 void ShmClientSession::getStatus(shmipc_client_status_t* out) const {

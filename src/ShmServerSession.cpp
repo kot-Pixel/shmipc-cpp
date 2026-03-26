@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <chrono>
 #include <climits>
+#include <cstring>
 #include <thread>
 
 void ShmServerSession::startRunReadThreadLoop() {
@@ -148,14 +149,16 @@ void ShmServerSession::onSharedMemoryReady(void* addr, size_t size, int fd,
     sendShareMemoryReady();
     LOGI("shared memory ready, sent ShareMemoryReady");
 
-    /* Start the futex-based consumer thread for the client_write region now
-     * that mClientWriteBuf is valid. */
+    /* Start async dispatch thread (if requested) before the consumer thread,
+     * so the queue is ready when the first message arrives. */
+    if (mCallbacks && mCallbacks->asyncDispatchDepth > 0)
+        startDispatch();
+
+    /* Start the futex-based consumer thread for the client_write region. */
     mConsumerRunning.store(true, std::memory_order_release);
     mClientWriteConsumerThread.reset(
         new std::thread(&ShmServerSession::clientWriteConsumerThread, this));
 
-    /* Fire onConnected now that both buffers are ready and the consumer thread
-     * is running — calling writData() inside the callback is safe. */
     if (mCallbacks && mCallbacks->onConnected)
         mCallbacks->onConnected(this);
 }
@@ -206,8 +209,9 @@ bool ShmServerSession::tryWriteOnce(const uint8_t* msg, uint32_t len) {
         return false;
     }
 
-    queue->events[tail].slice_index = first;
-    queue->events[tail].length      = len;
+    queue->events[tail].slice_index  = first;
+    queue->events[tail].length       = len;
+    queue->events[tail].write_ts_ns  = shm_now_ns();
     queue->tail.store(next_tail, std::memory_order_release);
 
     uint32_t prev_flags = queue->workingFlags.fetch_or(WORKING_FLAG, std::memory_order_acq_rel);
@@ -272,11 +276,98 @@ void ShmServerSession::clientWriteConsumerThread() {
 
 void ShmServerSession::stopClientWriteConsumer() {
     mConsumerRunning.store(false, std::memory_order_release);
-    /* Wake the sleeping consumer thread so it can observe mConsumerRunning. */
     if (mClientWriteBuf)
         shm_futex_wake(&mClientWriteBuf->io_queue.workingFlags, INT_MAX);
     if (mClientWriteConsumerThread && mClientWriteConsumerThread->joinable())
         mClientWriteConsumerThread->join();
+    stopDispatch();
+}
+
+/* ── Async dispatch ──────────────────────────────────────────────── */
+
+void ShmServerSession::startDispatch() {
+    if (!mCallbacks || mCallbacks->asyncDispatchDepth == 0) return;
+    mDispatchQueue.reset(new ShmDispatchQueue(mCallbacks->asyncDispatchDepth));
+    mDispatchThread.reset(new std::thread(&ShmServerSession::dispatchLoop, this));
+    LOGI("ShmServerSession async dispatch started (depth=%u)",
+         mCallbacks->asyncDispatchDepth);
+}
+
+void ShmServerSession::stopDispatch() {
+    if (mDispatchQueue) mDispatchQueue->stop();
+    if (mDispatchThread && mDispatchThread->joinable()) mDispatchThread->join();
+    mDispatchThread.reset();
+    mDispatchQueue.reset();
+}
+
+void ShmServerSession::dispatchLoop() {
+    while (auto* buf = mDispatchQueue->pop()) {
+        if (!mCallbacks) { shmipc_buf_free(buf); continue; }
+        if (mCallbacks->onDataZc) {
+            mCallbacks->onDataZc(this, buf);           /* app owns buf */
+        } else if (mCallbacks->onData) {
+            mCallbacks->onData(this, buf->data, buf->len);
+            shmipc_buf_free(buf);
+        } else {
+            shmipc_buf_free(buf);
+        }
+    }
+}
+
+/* ── Write-side zero-copy ────────────────────────────────────────── */
+
+shmipc_wbuf_t* ShmServerSession::allocWriteBuf(uint32_t len) {
+    if (!mServerWriteBuf || !mAlive) return nullptr;
+    auto* list = &mServerWriteBuf->buffer_list;
+    if (len == 0 || len > list->slice_size) return nullptr;
+
+    uint32_t idx = alloc_slice(list);
+    if (idx == INVALID_INDEX) return nullptr;
+
+    auto* wb       = new shmipc_wbuf_t;
+    wb->data       = get_slice_data(get_slice(list, idx));
+    wb->capacity   = list->slice_size;
+    wb->slice_idx  = idx;
+    wb->manager    = mServerWriteBuf;
+    return wb;
+}
+
+int ShmServerSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
+    if (!buf) return SHMIPC_ERR;
+    if (!mServerWriteBuf || !mAlive || len == 0 || len > buf->capacity) {
+        discardWriteBuf(buf);
+        return SHMIPC_ERR;
+    }
+
+    auto* list = &mServerWriteBuf->buffer_list;
+    ShmBufferSlice* s = get_slice(list, buf->slice_idx);
+    s->length = len;
+    s->next   = INVALID_INDEX;
+
+    bool ok;
+    {
+        std::lock_guard<std::mutex> g(mWriteMutex);
+        ok = shm_queue_commit(&mServerWriteBuf->io_queue, buf->slice_idx, len);
+    }
+
+    if (!ok) {
+        /* Queue full — free the slice before destroying the handle. */
+        free_slice(list, buf->slice_idx);
+    } else {
+        mBytesSent.fetch_add(len, std::memory_order_relaxed);
+        mMsgsSent .fetch_add(1,   std::memory_order_relaxed);
+    }
+    delete buf;
+
+    if (ok) { dataSyncServerWrite(); return SHMIPC_OK; }
+    return SHMIPC_ERR;
+}
+
+void ShmServerSession::discardWriteBuf(shmipc_wbuf_t* buf) {
+    if (!buf) return;
+    if (buf->manager)
+        free_slice(&buf->manager->buffer_list, buf->slice_idx);
+    delete buf;
 }
 
 void ShmServerSession::sendShareMemoryReady() {
@@ -314,7 +405,11 @@ void ShmServerSession::handleShareMemoryByMemfd() {
 }
 
 void ShmServerSession::readFromClientWriteBuffer() {
-    if (!mClientWriteBuf || !mCallbacks || !mCallbacks->onData) return;
+    if (!mClientWriteBuf || !mCallbacks) return;
+    const bool hasZc       = static_cast<bool>(mCallbacks->onDataZc);
+    const bool hasData     = static_cast<bool>(mCallbacks->onData);
+    const bool hasDispatch = (mDispatchQueue != nullptr);
+    if (!hasZc && !hasData) return;
 
     auto*    queue = &mClientWriteBuf->io_queue;
     auto*    list  = &mClientWriteBuf->buffer_list;
@@ -331,31 +426,33 @@ void ShmServerSession::readFromClientWriteBuffer() {
             ShmBufferEvent& event = queue->events[head % cap];
             uint32_t slice_index  = event.slice_index;
             uint32_t total_len    = event.length;
+            uint64_t latency_ns   = shm_now_ns() - event.write_ts_ns;
 
             if (slice_index != INVALID_INDEX) {
-                std::vector<uint8_t> out;
-                out.reserve(total_len);
-                uint32_t remaining = total_len;
-                uint32_t idx       = slice_index;
+                mRecvLatency.record(latency_ns);
+                mBytesReceived.fetch_add(total_len, std::memory_order_relaxed);
+                mMsgsReceived .fetch_add(1,         std::memory_order_relaxed);
 
-                while (idx != INVALID_INDEX && remaining > 0) {
-                    ShmBufferSlice* s    = get_slice(list, idx);
-                    uint8_t*        data = get_slice_data(s);
-                    uint32_t        copy = std::min(remaining, s->length);
-                    out.insert(out.end(), data, data + copy);
-                    remaining -= copy;
-                    idx = s->next;
-                }
+                /* Decode into shmipc_buf_t* using the shared helper.
+                 * want_borrow=true only when on_data_zc is registered, so
+                 * the SHM slice is freed immediately for non-ZC paths. */
+                shmipc_buf_t* buf = shmipc_buf_decode(
+                    list, slice_index, total_len, /*want_borrow=*/hasZc);
 
-                mBytesReceived.fetch_add(out.size(), std::memory_order_relaxed);
-                mMsgsReceived .fetch_add(1,          std::memory_order_relaxed);
-                mCallbacks->onData(this, out.data(), out.size());
-
-                idx = slice_index;
-                while (idx != INVALID_INDEX) {
-                    uint32_t next = get_slice(list, idx)->next;
-                    free_slice(list, idx);
-                    idx = next;
+                if (hasDispatch) {
+                    /* Async dispatch: push to queue; retry (100 µs) if full. */
+                    while (!mDispatchQueue->try_push(buf)) {
+                        if (!mConsumerRunning.load(std::memory_order_acquire)) {
+                            shmipc_buf_free(buf);
+                            goto done;
+                        }
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+                } else if (hasZc) {
+                    mCallbacks->onDataZc(this, buf);   /* app owns buf */
+                } else {
+                    mCallbacks->onData(this, buf->data, buf->len);
+                    shmipc_buf_free(buf);
                 }
             }
 
@@ -370,6 +467,7 @@ void ShmServerSession::readFromClientWriteBuffer() {
         head = queue->head.load(std::memory_order_acquire);
         tail = queue->tail.load(std::memory_order_acquire);
     } while (head != tail);
+    done:;
 }
 
 void ShmServerSession::getStatus(shmipc_session_status_t* out) const {

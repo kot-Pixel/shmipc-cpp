@@ -100,6 +100,12 @@ void ShmServer::setOnData(std::function<void(ShmServerSession*, const void*, uin
     };
 }
 
+void ShmServer::setOnDataZc(std::function<void(ShmServerSession*, shmipc_buf_t*)> cb) {
+    mSessionCallbacks.onDataZc = [cb](void* s, shmipc_buf_t* buf) {
+        if (cb) cb(static_cast<ShmServerSession*>(s), buf);
+    };
+}
+
 void ShmServer::setOnDisconnected(std::function<void(ShmServerSession*)> cb) {
     mSessionCallbacks.onDisconnected = [cb](void* s) {
         if (cb) cb(static_cast<ShmServerSession*>(s));

@@ -30,6 +30,10 @@ void ShmClient::setOnData(std::function<void(const void*, uint32_t)> cb) {
     mSession->setOnData(std::move(cb));
 }
 
+void ShmClient::setOnDataZc(std::function<void(shmipc_buf_t*)> cb) {
+    mSession->setOnDataZc(std::move(cb));
+}
+
 void ShmClient::setOnDisconnected(std::function<void()> cb) {
     mSession->setOnDisconnected(std::move(cb));
 }

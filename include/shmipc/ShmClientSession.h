@@ -12,7 +12,9 @@
 #include "ShmProtocolHandler.h"
 #include "ShmMessageQueue.h"
 #include "ShmBufferManager.h"
+#include "ShmDispatchQueue.h"
 #include "ShmMetadata.h"
+#include "ShmLatency.h"
 #include "ShareMemoryManager.h"
 #include "ShmConfig.h"
 #include "shmipc/shmipc.h"
@@ -26,18 +28,30 @@ public:
 
     int  connect(const char* name);
     void disconnect();
+    void joinThreads();
     /* timeout_ms: -1 = non-blocking (drop immediately)
      *              0 = block until space is available
      *            > 0 = block up to N milliseconds, return SHMIPC_TIMEOUT on expiry */
     int  writData(const uint8_t* data, uint32_t len, int32_t timeout_ms = -1);
 
+    /* Write-side zero-copy API (symmetric with ShmServerSession). */
+    shmipc_wbuf_t* allocWriteBuf  (uint32_t len);
+    int            sendWriteBuf   (shmipc_wbuf_t* buf, uint32_t len);
+    void           discardWriteBuf(shmipc_wbuf_t* buf);
+
+    /* Async dispatch depth; must be set before connect(). */
+    void setAsyncDispatchDepth(uint32_t depth) { mAsyncDispatchDepth = depth; }
+
     bool isConnected() const { return mConnected.load(std::memory_order_acquire); }
 
-    void getStatus(shmipc_client_status_t* out) const;
+    void getStatus (shmipc_client_status_t*  out) const;
+    void getLatency(shmipc_latency_stats_t*  out) const { mRecvLatency.get(out);  }
+    void resetLatency()                                 { mRecvLatency.reset();   }
 
-    void setOnConnected(std::function<void()> cb)                      { mOnConnected    = std::move(cb); }
-    void setOnData(std::function<void(const void*, uint32_t)> cb)      { mOnData         = std::move(cb); }
-    void setOnDisconnected(std::function<void()> cb)                   { mOnDisconnected = std::move(cb); }
+    void setOnConnected   (std::function<void()> cb)                    { mOnConnected    = std::move(cb); }
+    void setOnData        (std::function<void(const void*, uint32_t)> cb) { mOnData       = std::move(cb); }
+    void setOnDataZc      (std::function<void(shmipc_buf_t*)> cb)       { mOnDataZc       = std::move(cb); }
+    void setOnDisconnected(std::function<void()> cb)                    { mOnDisconnected = std::move(cb); }
 
     /* Apply preset/custom config before calling connect() */
     void setConfig(uint32_t shmSize, uint32_t eventQueueCapacity, uint32_t sliceSize);
@@ -60,9 +74,13 @@ private:
 
     std::function<void()>                      mOnConnected;
     std::function<void(const void*, uint32_t)> mOnData;
+    std::function<void(shmipc_buf_t*)>         mOnDataZc;
     std::function<void()>                      mOnDisconnected;
 
     std::mutex          mWriteMutex;    /* serialises concurrent calls to writData() */
+
+    /* Receive-side latency histogram (server→client direction) */
+    mutable LatencyHistogram mRecvLatency;
 
     /* Traffic counters — incremented atomically, never reset */
     std::atomic<uint64_t> mBytesSent{0};
@@ -99,6 +117,14 @@ private:
     void serverWriteConsumerThread();
     /* Stop + join the consumer thread (idempotent). */
     void stopServerWriteConsumer();
+
+    /* Async dispatch */
+    uint32_t mAsyncDispatchDepth = 0;
+    std::unique_ptr<ShmDispatchQueue> mDispatchQueue;
+    std::unique_ptr<std::thread>      mDispatchThread;
+    void startDispatch();
+    void stopDispatch();
+    void dispatchLoop();
 
     void readFromServerWriteBuffer();
     void notifyServerOfClientWrite();

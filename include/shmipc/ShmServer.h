@@ -16,6 +16,7 @@
 #include "ShmServerSessionManager.h"
 #include "ShmLogger.h"
 #include "ShmConfig.h"
+#include "shmipc/shmipc.h"
 
 class ShmServer {
     int server_fd = -1;
@@ -39,9 +40,12 @@ public:
     int  start(const char* name);
     void stop();
 
-    void setOnConnected(std::function<void(ShmServerSession*)> cb);
-    void setOnData(std::function<void(ShmServerSession*, const void*, uint32_t)> cb);
-    void setOnDisconnected(std::function<void(ShmServerSession*)> cb);
+    void setOnConnected         (std::function<void(ShmServerSession*)> cb);
+    void setOnData              (std::function<void(ShmServerSession*, const void*, uint32_t)> cb);
+    void setOnDataZc            (std::function<void(ShmServerSession*, shmipc_buf_t*)> cb);
+    void setOnDisconnected      (std::function<void(ShmServerSession*)> cb);
+    void setAsyncDispatchDepth  (uint32_t depth)
+        { mSessionCallbacks.asyncDispatchDepth = depth; }
 
 
     std::vector<ShmServerSession*> getAllSessions();

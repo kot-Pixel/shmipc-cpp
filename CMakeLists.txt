@@ -97,6 +97,12 @@ if(SHMIPC_BUILD_TESTS)
 
     add_executable(shmipc_test3_duplex tests/test3_duplex.c)
     target_link_libraries(shmipc_test3_duplex PRIVATE shmipc pthread)
+
+    add_executable(shmipc_test4_zc tests/test4_zc.c)
+    target_link_libraries(shmipc_test4_zc PRIVATE shmipc pthread)
+
+    add_executable(shmipc_test5_latency tests/test5_latency.c)
+    target_link_libraries(shmipc_test5_latency PRIVATE shmipc pthread)
 endif()
 
 # ---------------------------------------------------------------
