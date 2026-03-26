@@ -103,6 +103,9 @@ if(SHMIPC_BUILD_TESTS)
 
     add_executable(shmipc_test5_latency tests/test5_latency.c)
     target_link_libraries(shmipc_test5_latency PRIVATE shmipc pthread)
+
+    add_executable(shmipc_test7_dispatch tests/test7_dispatch.c)
+    target_link_libraries(shmipc_test7_dispatch PRIVATE shmipc pthread)
 endif()
 
 # ---------------------------------------------------------------

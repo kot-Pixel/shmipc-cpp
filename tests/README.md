@@ -23,7 +23,10 @@ tests/
 ├── test_common.h      — 公共定义：消息格式、预设参数、写模式、工具函数
 ├── test1_s2c.c        — 单向 Server → Client 基准测试
 ├── test2_c2s.c        — 单向 Client → Server 基准测试
-└── test3_duplex.c     — 全双工 + 多写线程 + 混合模式测试
+├── test3_duplex.c     — 全双工 + 多写线程 + 混合模式测试
+├── test4_zc.c         — 接收侧零拷贝 on_data_zc / 多 slice 回退
+├── test5_latency.c    — 延迟直方图与 reset_latency
+└── test7_dispatch.c   — 异步 dispatch：`set_async_dispatch` + 慢回调 + 突发发送
 ```
 
 ---
@@ -143,6 +146,16 @@ GENERAL preset，3 种非对称 Pair（4KB↔1MB，64KB↔64KB，1MB↔4KB）。
 
 ---
 
+## 6.5 test4_zc / test5_latency / test7_dispatch
+
+| 程序 | 目的 |
+|------|------|
+| **test4_zc** | `on_data_zc` 单 slice 借用 SHM；大于 slice 时 heap 回退；完整性校验 |
+| **test5_latency** | `get_latency` / `reset_latency`；S→C 与 C→S 直方图合理性 |
+| **test7_dispatch** | **异步 dispatch 专项**：`shmipc_*_set_async_dispatch(64)` 在 `start`/`connect` 之前启用；接收端 `on_data` 每次约 **1.2 ms** 休眠，对端 **连续突发 48 条** 小消息（64B 负载）。**[A] S→C** 测客户端 dispatch；**[B] C→S** 测服务端 dispatch。校验 `recv == 48`、**seq 严格递增**、`STOP` 哨兵。退出码 `0` = `overall: PASS`。 |
+
+---
+
 ## 7. 构建与运行
 
 ```bash
@@ -150,12 +163,16 @@ GENERAL preset，3 种非对称 Pair（4KB↔1MB，64KB↔64KB，1MB↔4KB）。
 cd /mnt/d/shmipc-c++/shmipc/build
 
 # 构建所有测试
-cmake --build . --target shmipc_test1_s2c shmipc_test2_c2s shmipc_test3_duplex -j4
+cmake --build . --target shmipc_test1_s2c shmipc_test2_c2s shmipc_test3_duplex \
+                       shmipc_test4_zc shmipc_test5_latency shmipc_test7_dispatch -j4
 
 # 运行（建议重定向 stderr 屏蔽库内部日志）
 ./shmipc_test1_s2c  2>/dev/null
 ./shmipc_test2_c2s  2>/dev/null
 ./shmipc_test3_duplex 2>/dev/null
+./shmipc_test4_zc  2>/dev/null
+./shmipc_test5_latency
+./shmipc_test7_dispatch
 ```
 
 退出码：`0` = 全部 PASS，`1` = 存在 FAIL。
