@@ -87,6 +87,7 @@ Outputs:
 | `SHMIPC_BUILD_SHARED` | `OFF` | `ON` builds `.so`, `OFF` builds `.a` |
 | `SHMIPC_BUILD_EXAMPLES` | `ON` | Build examples/ |
 | `SHMIPC_BUILD_TESTS` | `ON` | Build tests/ |
+| `SHMIPC_ANDROID_MIN_SIZE` | `ON` | Extra Android size flags for static workflows |
 
 ```bash
 # Shared library only, no examples or tests
@@ -107,6 +108,63 @@ cmake -S shmipc -B build_arm64 \
     -DSHMIPC_BUILD_TESTS=OFF
 cmake --build build_arm64 -j$(nproc) --target shmipc
 ```
+
+### Android arm64-v8a: test binaries
+
+Cross-compile tests with the NDK; keep **`SHMIPC_BUILD_TESTS=ON`** and usually **`SHMIPC_BUILD_SHARED=OFF`** so each test statically links `libshmipc.a` (one file per `adb push`).
+
+From **`shmipc/`**:
+
+```bash
+export ANDROID_NDK_HOME=/path/to/ndk
+
+cmake -S . -B build_android_tests \
+    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-21 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DSHMIPC_BUILD_SHARED=OFF \
+    -DSHMIPC_BUILD_EXAMPLES=OFF \
+    -DSHMIPC_BUILD_TESTS=ON
+
+cmake --build build_android_tests -j$(nproc)
+```
+
+**Outputs:** `build_android_tests/libshmipc.a`, `build_android_tests/shmipc_test1_s2c`, …, `shmipc_test7_dispatch`.
+
+**Run on device:**
+
+```bash
+adb push build_android_tests/shmipc_test7_dispatch /data/local/tmp/
+adb shell chmod 755 /data/local/tmp/shmipc_test7_dispatch
+adb shell /data/local/tmp/shmipc_test7_dispatch
+```
+
+If you use **`SHMIPC_BUILD_SHARED=ON`**, push `libshmipc.so` next to the binary or set **`LD_LIBRARY_PATH`**. Try **`ANDROID_PLATFORM=android-24`** if you hit link/runtime issues on old APIs.
+
+### Android static `.a` too large? (size-first build)
+
+`.a` archives keep object files and symbol metadata, so they are usually much larger than `.so`.
+For minimum static size, use `MinSizeRel` + section flags (`SHMIPC_ANDROID_MIN_SIZE=ON`):
+
+```bash
+cmake -S . -B build_android_static_min \
+    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-21 \
+    -DCMAKE_BUILD_TYPE=MinSizeRel \
+    -DSHMIPC_BUILD_SHARED=OFF \
+    -DSHMIPC_BUILD_EXAMPLES=OFF \
+    -DSHMIPC_BUILD_TESTS=OFF \
+    -DSHMIPC_ANDROID_MIN_SIZE=ON
+
+cmake --build build_android_static_min -j$(nproc) --target shmipc
+```
+
+Important:
+- Use a **new build directory** when switching static/shared builds to avoid CMake cache reusing `SHMIPC_BUILD_SHARED`.
+- `cmake --install` defaults to `/usr/local` and may fail without permission. Use:
+  `cmake --install build_android_static_min --prefix ./dist_android_static_min`
 
 ---
 

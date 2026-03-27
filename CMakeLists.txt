@@ -8,6 +8,7 @@ set(CMAKE_C_STANDARD 11)
 
 option(SHMIPC_BUILD_SHARED  "Build as shared library instead of static" OFF)
 option(SHMIPC_BUILD_EXAMPLES "Build example server/client programs"     ON)
+option(SHMIPC_ANDROID_MIN_SIZE "Enable extra Android size optimizations" ON)
 
 set(SHMIPC_SOURCES
     src/ShmBufferManager.cpp
@@ -66,6 +67,9 @@ endif()
 if(ANDROID)
     target_compile_options(shmipc PRIVATE
         -Os
+        -g0
+        -ffunction-sections
+        -fdata-sections
         -fno-rtti
         -fno-unwind-tables
         -fno-asynchronous-unwind-tables
@@ -75,6 +79,15 @@ if(ANDROID)
         target_link_options(shmipc PRIVATE
             -Wl,--gc-sections
             -Wl,--strip-all
+        )
+    endif()
+
+    # Optional extra size pass for static-library workflows.
+    # Note: --gc-sections is effective at final executable link time.
+    if(SHMIPC_ANDROID_MIN_SIZE AND NOT SHMIPC_BUILD_SHARED)
+        target_compile_options(shmipc PRIVATE
+            $<$<CONFIG:Release>:-Oz>
+            $<$<CONFIG:MinSizeRel>:-Oz>
         )
     endif()
 endif()
@@ -88,24 +101,22 @@ if(SHMIPC_BUILD_EXAMPLES)
 endif()
 
 option(SHMIPC_BUILD_TESTS "Build benchmark / integration tests" ON)
+# Tests link pthread on Linux desktop; Android Bionic includes pthread — no -lpthread.
+function(shmipc_add_test name src)
+    add_executable(${name} tests/${src})
+    target_link_libraries(${name} PRIVATE shmipc)
+    if(NOT ANDROID)
+        target_link_libraries(${name} PRIVATE pthread)
+    endif()
+endfunction()
+
 if(SHMIPC_BUILD_TESTS)
-    add_executable(shmipc_test1_s2c tests/test1_s2c.c)
-    target_link_libraries(shmipc_test1_s2c PRIVATE shmipc pthread)
-
-    add_executable(shmipc_test2_c2s tests/test2_c2s.c)
-    target_link_libraries(shmipc_test2_c2s PRIVATE shmipc pthread)
-
-    add_executable(shmipc_test3_duplex tests/test3_duplex.c)
-    target_link_libraries(shmipc_test3_duplex PRIVATE shmipc pthread)
-
-    add_executable(shmipc_test4_zc tests/test4_zc.c)
-    target_link_libraries(shmipc_test4_zc PRIVATE shmipc pthread)
-
-    add_executable(shmipc_test5_latency tests/test5_latency.c)
-    target_link_libraries(shmipc_test5_latency PRIVATE shmipc pthread)
-
-    add_executable(shmipc_test7_dispatch tests/test7_dispatch.c)
-    target_link_libraries(shmipc_test7_dispatch PRIVATE shmipc pthread)
+    shmipc_add_test(shmipc_test1_s2c   test1_s2c.c)
+    shmipc_add_test(shmipc_test2_c2s   test2_c2s.c)
+    shmipc_add_test(shmipc_test3_duplex test3_duplex.c)
+    shmipc_add_test(shmipc_test4_zc    test4_zc.c)
+    shmipc_add_test(shmipc_test5_latency test5_latency.c)
+    shmipc_add_test(shmipc_test7_dispatch test7_dispatch.c)
 endif()
 
 # ---------------------------------------------------------------

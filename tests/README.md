@@ -158,6 +158,8 @@ GENERAL preset，3 种非对称 Pair（4KB↔1MB，64KB↔64KB，1MB↔4KB）。
 
 ## 7. 构建与运行
 
+### 7.1 本机 Linux（x86_64）
+
 ```bash
 # 进入构建目录（WSL 路径示例）
 cd /mnt/d/shmipc-c++/shmipc/build
@@ -176,6 +178,25 @@ cmake --build . --target shmipc_test1_s2c shmipc_test2_c2s shmipc_test3_duplex \
 ```
 
 退出码：`0` = 全部 PASS，`1` = 存在 FAIL。
+
+### 7.2 Android arm64-v8a（NDK 交叉编译）
+
+在 **`shmipc/`** 目录下（需已设置 `ANDROID_NDK_HOME`）：
+
+```bash
+cmake -S . -B build_android_tests \
+    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-21 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DSHMIPC_BUILD_SHARED=OFF \
+    -DSHMIPC_BUILD_EXAMPLES=OFF \
+    -DSHMIPC_BUILD_TESTS=ON
+
+cmake --build build_android_tests -j$(nproc)
+```
+
+产物位于 `build_android_tests/`，可执行文件为 arm64 ELF。推送到设备：`adb push … /data/local/tmp/`，`chmod 755` 后 `adb shell` 运行。更完整的说明见仓库根目录 **`README.md` / `README_zh-CN.md`** 中的「Android … 测试程序」小节。
 
 ---
 
