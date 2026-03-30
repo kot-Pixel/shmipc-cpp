@@ -161,17 +161,20 @@ typedef struct shmipc_buf shmipc_buf_t;
  *  Write-side zero-copy handle
  *
  *  Returned by shmipc_session_alloc_buf / shmipc_client_alloc_buf.
- *  The caller writes directly into `data` (up to `capacity` bytes)
- *  then calls *_send_buf(buf, actual_len) to enqueue it without
- *  any additional memcpy.
+ *  Single-slice: len <= slice_size — `data` is that slice, capacity == slice_size.
+ *  Multi-slice: len > slice_size — slice chain (same layout as tryWriteOnce);
+ *  use shmipc_wbuf_slice_data / shmipc_wbuf_slice_bytes to fill each segment.
  *
  *  Ownership: *_send_buf and *_discard_buf always consume the handle.
  * --------------------------------------------------------------- */
 struct shmipc_wbuf {
-    uint8_t*          data;       /* writable pointer into the SHM slice        */
-    uint32_t          capacity;   /* usable bytes (== slice_size)               */
-    uint32_t          slice_idx;  /* pre-allocated slice index in the SHM list  */
-    ShmBufferManager* manager;    /* owning buffer manager (server or client)   */
+    uint8_t*          data;       /* first segment; use slice_data(i) for i>0       */
+    uint32_t          capacity;   /* single-slice: slice_size; multi: total length  */
+    uint32_t          slice_idx;  /* head slice index in the SHM list               */
+    uint32_t          num_slices; /* 1 or more                                      */
+    uint32_t          seg_size;   /* buffer_list.slice_size (for slice_bytes)     */
+    uint32_t          alloc_len;  /* len passed to alloc_buf (fill / send contract) */
+    ShmBufferManager* manager;
 };
 typedef struct shmipc_wbuf shmipc_wbuf_t;
 

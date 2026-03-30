@@ -1,10 +1,11 @@
 /*
  * test4_zc.c — Zero-copy on_data_zc API validation
  *
- * Three test sections:
- *   [ZC-S2C Integrity]      server→client, every byte verified via on_data_zc
- *   [ZC-C2S Integrity]      client→server, every byte verified via on_data_zc
- *   [ZC vs COPY Throughput] recv MB/s comparison: on_data vs on_data_zc, S→C
+ * Test sections:
+ *   [ZC-S2C Integrity]       server→client, every byte verified via on_data_zc
+ *   [ZC-C2S Integrity]       client→server, every byte verified via on_data_zc
+ *   [ZC-WBUF-C2S / S2C]      write-side alloc_buf/send_buf (incl. multi-slice), recv ZC
+ *   [ZC vs COPY Throughput]  recv MB/s comparison: on_data vs on_data_zc, S→C
  *
  * Preset: LOW_FREQ  (shm=8 MB, queue=32, slice=4 KB)
  *   payload ≤ 4096 B  →  borrowed SHM pointer  (true zero-copy path)
@@ -50,6 +51,11 @@ static const uint32_t ZC_PAYS[] = {
     524288, /* multi-slice,  heap copy (512 KB) */
 };
 #define N_ZC_PAY 7
+
+/* Write-side ZC (alloc_buf / send_buf): boundary + multi-slice */
+#define WBUF_MSGS 24
+static const uint32_t WBUF_PAYS[] = { 4088u, 4090u, 8192u, 65536u };
+#define N_WBUF_PAY 4
 
 /* Throughput comparison payloads */
 static const uint32_t TPUT_PAYS[] = { 1024, 65536, 262144 };  /* 1 KB, 64 KB, 256 KB */
@@ -144,6 +150,59 @@ static void zc_srv_cb(shmipc_session_t *s, shmipc_buf_t *buf, void *ctx)
                &z->res.recv, &z->res.errs, &z->stop_seen,
                &z->timing_started, &z->t_first_ms, &z->t_stop_ms);
     shmipc_buf_release(buf);
+}
+
+/* Build wire message in tmp[], copy into SHM via alloc_buf (multi-slice when needed). */
+static int send_client_wbuf_zc(shmipc_client_t *cli, uint8_t *tmp, uint32_t seq, uint32_t plen)
+{
+    uint32_t total = HDR_SZ + plen;
+    fill_msg(tmp, seq, plen);
+    shmipc_wbuf_t *wb = shmipc_client_alloc_buf(cli, total);
+    if (!wb)
+        return -1;
+    uint32_t ns  = shmipc_wbuf_num_slices(wb);
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < ns; i++) {
+        uint32_t  nb  = shmipc_wbuf_slice_bytes(wb, i);
+        uint8_t * dst = (uint8_t *)shmipc_wbuf_slice_data(wb, i);
+        if (!dst || nb == 0 || off + nb > total) {
+            shmipc_client_discard_buf(cli, wb);
+            return -1;
+        }
+        memcpy(dst, tmp + off, nb);
+        off += nb;
+    }
+    if (off != total) {
+        shmipc_client_discard_buf(cli, wb);
+        return -1;
+    }
+    return shmipc_client_send_buf(cli, wb, total);
+}
+
+static int send_session_wbuf_zc(shmipc_session_t *sess, uint8_t *tmp, uint32_t seq, uint32_t plen)
+{
+    uint32_t total = HDR_SZ + plen;
+    fill_msg(tmp, seq, plen);
+    shmipc_wbuf_t *wb = shmipc_session_alloc_buf(sess, total);
+    if (!wb)
+        return -1;
+    uint32_t ns  = shmipc_wbuf_num_slices(wb);
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < ns; i++) {
+        uint32_t  nb  = shmipc_wbuf_slice_bytes(wb, i);
+        uint8_t * dst = (uint8_t *)shmipc_wbuf_slice_data(wb, i);
+        if (!dst || nb == 0 || off + nb > total) {
+            shmipc_session_discard_buf(sess, wb);
+            return -1;
+        }
+        memcpy(dst, tmp + off, nb);
+        off += nb;
+    }
+    if (off != total) {
+        shmipc_session_discard_buf(sess, wb);
+        return -1;
+    }
+    return shmipc_session_send_buf(sess, wb, total);
 }
 
 /* on_data (copying) callback for throughput comparison */
@@ -519,6 +578,237 @@ static void run_client_tput(int s2c_rd, int c2s_wr, int use_zc)
     shmipc_client_destroy(cli);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Section 3a/3b: [ZC-WBUF] client/server alloc_buf + send_buf (multi-slice)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void run_server_wbuf_c2s(int s2c_wr, int c2s_rd)
+{
+    zc_srv_t ctx = { NULL, 0, {0, 0, 0, 0}, 0, 0, 0, 0.0, 0.0 };
+
+    shmipc_server_t *srv = shmipc_server_create();
+    shmipc_server_set_context(srv, &ctx);
+    shmipc_server_register_on_connected(srv, zc_srv_on_conn);
+    shmipc_server_register_on_disconnected(srv, zc_srv_on_disc);
+    shmipc_server_register_on_data_zc(srv, zc_srv_cb);
+
+    if (shmipc_server_start(srv, "t4_wbuf_c2s") != SHMIPC_OK) {
+        fprintf(stderr, "[t4-wbuf-c2s] server start failed\n");
+        shmipc_server_destroy(srv);
+        return;
+    }
+
+    char ch;
+    pipe_rd(c2s_rd, &ch, 1);
+    wait_flag(&ctx.connected, 10);
+    if (!ctx.connected) {
+        fprintf(stderr, "[t4-wbuf-c2s] no session\n");
+        goto done;
+    }
+
+    for (int pi = 0; pi < N_WBUF_PAY; pi++) {
+        uint32_t plen = WBUF_PAYS[pi];
+        ctx.expected_pay   = plen;
+        ctx.res.recv       = 0;
+        ctx.res.errs       = 0;
+        ctx.stop_seen      = 0;
+        ctx.timing_started = 0;
+
+        ch = 'G';
+        pipe_wr(s2c_wr, &ch, 1);
+        pipe_rd(c2s_rd, &ch, 1);
+
+        int ticks = 0;
+        while (!ctx.stop_seen && ticks < 300000) {
+            usleep(100);
+            ticks++;
+        }
+
+        int ok = (ctx.res.errs == 0 && ctx.res.recv == (uint32_t)WBUF_MSGS);
+        ch     = ok ? 'P' : 'F';
+        pipe_wr(s2c_wr, &ch, 1);
+        pipe_rd(c2s_rd, &ch, 1);
+    }
+
+    ch = 'X';
+    pipe_wr(s2c_wr, &ch, 1);
+done:
+    shmipc_server_stop(srv);
+    shmipc_server_destroy(srv);
+}
+
+static int run_client_wbuf_c2s(int s2c_rd, int c2s_wr)
+{
+    shmipc_client_t *cli = shmipc_client_create();
+    shmipc_client_set_config(cli, &(shmipc_config_t){ ZC_SHM, ZC_CAP, ZC_SLICE });
+
+    char ch = 'R';
+    pipe_wr(c2s_wr, &ch, 1);
+
+    for (int retry = 0; retry < 50; retry++) {
+        if (shmipc_client_connect(cli, "t4_wbuf_c2s") == SHMIPC_OK)
+            break;
+        usleep(100000);
+    }
+
+    uint8_t *tmp = (uint8_t *)malloc(HDR_SZ + WBUF_PAYS[N_WBUF_PAY - 1]);
+    if (!tmp) {
+        perror("malloc");
+        shmipc_client_destroy(cli);
+        return 1;
+    }
+
+    int failures = 0;
+
+    for (int pi = 0; pi < N_WBUF_PAY; pi++) {
+        uint32_t plen = WBUF_PAYS[pi];
+
+        pipe_rd(s2c_rd, &ch, 1);
+        ch = 'A';
+        pipe_wr(c2s_wr, &ch, 1);
+
+        for (int mi = 0; mi < WBUF_MSGS; mi++) {
+            if (send_client_wbuf_zc(cli, tmp, (uint32_t)mi, plen) != SHMIPC_OK) {
+                failures++;
+                break;
+            }
+        }
+        fill_stop(tmp);
+        shmipc_client_write(cli, tmp, HDR_SZ, SHMIPC_TIMEOUT_INFINITE);
+
+        pipe_rd(s2c_rd, &ch, 1);
+        pipe_wr(c2s_wr, &ch, 1);
+        if (ch == 'F')
+            failures++;
+    }
+
+    pipe_rd(s2c_rd, &ch, 1);
+
+    shmipc_wbuf_t *wb = shmipc_client_alloc_buf(cli, 64);
+    if (wb)
+        shmipc_client_discard_buf(cli, wb);
+
+    free(tmp);
+    shmipc_client_disconnect(cli);
+    shmipc_client_destroy(cli);
+    return failures;
+}
+
+static void run_server_wbuf_s2c(int s2c_wr, int c2s_rd)
+{
+    zc_srv_t ctx = { NULL, 0, {0, 0, 0, 0}, 0, 0, 0, 0.0, 0.0 };
+
+    shmipc_server_t *srv = shmipc_server_create();
+    shmipc_server_set_context(srv, &ctx);
+    shmipc_server_register_on_connected(srv, zc_srv_on_conn);
+    shmipc_server_register_on_disconnected(srv, zc_srv_on_disc);
+
+    if (shmipc_server_start(srv, "t4_wbuf_s2c") != SHMIPC_OK) {
+        fprintf(stderr, "[t4-wbuf-s2c] server start failed\n");
+        shmipc_server_destroy(srv);
+        return;
+    }
+
+    char ch;
+    pipe_rd(c2s_rd, &ch, 1);
+    wait_flag(&ctx.connected, 10);
+    if (!ctx.connected) {
+        fprintf(stderr, "[t4-wbuf-s2c] no session\n");
+        goto done;
+    }
+
+    uint8_t *tmp = (uint8_t *)malloc(HDR_SZ + WBUF_PAYS[N_WBUF_PAY - 1]);
+    if (!tmp) {
+        perror("malloc");
+        goto done;
+    }
+
+    for (int pi = 0; pi < N_WBUF_PAY; pi++) {
+        uint32_t plen = WBUF_PAYS[pi];
+
+        ch = 'G';
+        pipe_wr(s2c_wr, &ch, 1);
+        pipe_wr(s2c_wr, &plen, sizeof(plen));
+        pipe_rd(c2s_rd, &ch, 1);
+
+        for (int mi = 0; mi < WBUF_MSGS; mi++) {
+            if (send_session_wbuf_zc(ctx.sess, tmp, (uint32_t)mi, plen) != SHMIPC_OK)
+                break;
+        }
+        fill_stop(tmp);
+        shmipc_session_write(ctx.sess, tmp, HDR_SZ, SHMIPC_TIMEOUT_INFINITE);
+
+        zc_result_t res;
+        pipe_rd(c2s_rd, &res, sizeof(res));
+        int ok = (res.errs == 0 && res.recv == (uint32_t)WBUF_MSGS);
+        ch     = ok ? 'P' : 'F';
+        pipe_wr(s2c_wr, &ch, 1);
+        pipe_rd(c2s_rd, &ch, 1);
+    }
+
+    free(tmp);
+    ch = 'X';
+    pipe_wr(s2c_wr, &ch, 1);
+done:
+    shmipc_server_stop(srv);
+    shmipc_server_destroy(srv);
+}
+
+static int run_client_wbuf_s2c(int s2c_rd, int c2s_wr)
+{
+    zc_cli_t ctx = { 0, 0, 0, 0, 0, 0.0, 0.0 };
+
+    shmipc_client_t *cli = shmipc_client_create();
+    shmipc_client_set_context(cli, &ctx);
+    shmipc_client_set_config(cli, &(shmipc_config_t){ ZC_SHM, ZC_CAP, ZC_SLICE });
+    shmipc_client_register_on_data_zc(cli, zc_cli_cb);
+
+    char ch = 'R';
+    pipe_wr(c2s_wr, &ch, 1);
+
+    for (int retry = 0; retry < 50; retry++) {
+        if (shmipc_client_connect(cli, "t4_wbuf_s2c") == SHMIPC_OK)
+            break;
+        usleep(100000);
+    }
+
+    int failures = 0;
+
+    for (;;) {
+        pipe_rd(s2c_rd, &ch, 1);
+        if (ch == 'X')
+            break;
+        uint32_t plen;
+        pipe_rd(s2c_rd, &plen, sizeof(plen));
+        ctx.recv = ctx.errs = 0;
+        ctx.stop_seen        = 0;
+        ctx.timing_started   = 0;
+        ctx.expected_pay     = plen;
+        ch                   = 'A';
+        pipe_wr(c2s_wr, &ch, 1);
+
+        int ticks = 0;
+        while (!ctx.stop_seen && ticks < 300000) {
+            usleep(100);
+            ticks++;
+        }
+
+        zc_result_t res;
+        res.recv = ctx.recv;
+        res.errs = ctx.errs;
+        pipe_wr(c2s_wr, &res, sizeof(res));
+
+        pipe_rd(s2c_rd, &ch, 1);
+        pipe_wr(c2s_wr, &ch, 1);
+        if (ch == 'F')
+            failures++;
+    }
+
+    shmipc_client_disconnect(cli);
+    shmipc_client_destroy(cli);
+    return failures;
+}
+
 /* ── Main ───────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -535,6 +825,8 @@ int main(void)
     int devnull = open("/dev/null", O_WRONLY);
     dup2(devnull, STDOUT_FILENO);
     dup2(devnull, STDERR_FILENO);
+
+    int wbuf_fail = 0;
 
     /* ── Section 1: ZC-S2C Integrity ──────────────────────────────── */
     {
@@ -570,7 +862,71 @@ int main(void)
         close(p1[1]); close(p2[0]);
     }
 
-    /* ── Section 3: ZC vs COPY Throughput ─────────────────────────── */
+    /* ── Section 3: write alloc_buf / send_buf (C2S + S2C) ─────────── */
+    {
+        int fc2s = 0, fs2c = 0;
+        {
+            int p1[2], p2[2];
+            if (pipe(p1) != 0 || pipe(p2) != 0)
+                perror("pipe");
+            else {
+                pid_t pid = fork();
+                if (pid == 0) {
+                    dup2(devnull, STDOUT_FILENO);
+                    close(p1[1]);
+                    close(p2[0]);
+                    int f = run_client_wbuf_c2s(p1[0], p2[1]);
+                    close(p1[0]);
+                    close(p2[1]);
+                    exit(f);
+                }
+                close(p1[0]);
+                close(p2[1]);
+                run_server_wbuf_c2s(p1[1], p2[0]);
+                int st = 0;
+                waitpid(pid, &st, 0);
+                if (WIFEXITED(st))
+                    fc2s = WEXITSTATUS(st);
+                else
+                    fc2s = 1;
+                close(p1[1]);
+                close(p2[0]);
+            }
+        }
+        {
+            int p1[2], p2[2];
+            if (pipe(p1) != 0 || pipe(p2) != 0)
+                perror("pipe");
+            else {
+                pid_t pid = fork();
+                if (pid == 0) {
+                    dup2(devnull, STDOUT_FILENO);
+                    close(p1[1]);
+                    close(p2[0]);
+                    int f = run_client_wbuf_s2c(p1[0], p2[1]);
+                    close(p1[0]);
+                    close(p2[1]);
+                    exit(f);
+                }
+                close(p1[0]);
+                close(p2[1]);
+                run_server_wbuf_s2c(p1[1], p2[0]);
+                int st = 0;
+                waitpid(pid, &st, 0);
+                if (WIFEXITED(st))
+                    fs2c = WEXITSTATUS(st);
+                else
+                    fs2c = 1;
+                close(p1[1]);
+                close(p2[0]);
+            }
+        }
+        wbuf_fail = fc2s + fs2c;
+        tprintf("\n[ZC write alloc_buf] C2S: %s  S2C: %s\n",
+                fc2s ? "FAIL" : "OK", fs2c ? "FAIL" : "OK");
+    }
+
+    /* ── Section 4: ZC vs COPY Throughput ─────────────────────────── */
     print_tput_header();
 
     for (int pi = 0; pi < N_TPUT_PAY; pi++) {
@@ -650,5 +1006,5 @@ int main(void)
 
     close(devnull);
     tprintf("\ndone.\n");
-    return 0;
+    return wbuf_fail ? 1 : 0;
 }

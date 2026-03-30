@@ -13,7 +13,7 @@
 | 特性 | 说明 |
 |------|------|
 | **零拷贝接收** | 单 slice 消息直接借用 SHM 指针，`on_data_zc` 无堆拷贝 |
-| **零拷贝写入** | `alloc_buf` / `send_buf` 让调用方原地填写 SHM slice，省去内部 `memcpy` |
+| **零拷贝写入** | `alloc_buf` / `send_buf` — 单条消息可单 slice 或多 slice，原地写 SHM，省去库内 `memcpy` |
 | **futex 通知** | `FUTEX_WAIT/WAKE` 替代 UDS 数据通知，减少上下文切换 |
 | **全双工** | `server_write` / `client_write` 独立 ring buffer，两侧并发无竞争 |
 | **崩溃感知** | UDS 连接断开时自动触发 `on_disconnected` 并释放共享内存 |
@@ -43,8 +43,9 @@ shmipc/
 │   ├── test1_s2c.c       ← Server→Client 基准
 │   ├── test2_c2s.c       ← Client→Server 基准
 │   ├── test3_duplex.c    ← 全双工 / 多线程 / 混合模式
-│   ├── test4_zc.c        ← 零拷贝接收 API 验证
+│   ├── test4_zc.c        ← 零拷贝接收 + 写端 alloc_buf/send_buf（含多 slice）
 │   ├── test5_latency.c   ← 延迟监控 API 验证
+│   ├── test7_dispatch.c  ← 异步 dispatch（慢回调 + 突发）
 │   └── README.md
 ├── CMakeLists.txt
 └── install.sh            ← 一键打包 dist/
@@ -78,7 +79,7 @@ cmake --build build -j$(nproc)
 构建产物：
 - `build/libshmipc.a` — 静态库
 - `build/shmipc_server`、`build/shmipc_client` — 示例程序
-- `build/shmipc_test1_s2c` … `build/shmipc_test5_latency` — 测试程序
+- `build/shmipc_test1_s2c` … `build/shmipc_test7_dispatch` — 测试程序
 
 ### CMake 选项
 
@@ -146,20 +147,39 @@ dist/
 
 ## API 参考
 
-### 配置预设
+对外头文件仅 `#include "shmipc/shmipc.h"`。不透明类型：`shmipc_server_t`、`shmipc_client_t`、`shmipc_session_t`（服务端每个已连接客户端对应一个 session）、`shmipc_buf_t`（接收端零拷贝句柄）、`shmipc_wbuf_t`（写端零拷贝：一个或多个 SHM slice）。回调在库内部线程（消费者 / 可选 dispatch 线程）执行；若未启用异步 dispatch，应避免在回调中长时间阻塞。
+
+### 返回值与宏
+
+| 符号 | 值 | 含义 |
+|------|-----|------|
+| `SHMIPC_OK` | `0` | 成功 |
+| `SHMIPC_ERR` | `-1` | 失败（参数非法、未连接、队列满等） |
+| `SHMIPC_TIMEOUT` | `-2` | `timeout_ms > 0` 时等待超时 |
+
+写接口的 `timeout_ms` 含义：
+
+| `timeout_ms` | 宏 | 行为 |
+|--------------|-----|------|
+| `-1` | `SHMIPC_TIMEOUT_NONBLOCKING` | 发送侧 ring 满则立即丢弃本次写入 |
+| `0` | `SHMIPC_TIMEOUT_INFINITE` | 阻塞直到有空间 |
+| `N > 0` | — | 最多等待 N 毫秒，超时返回 `SHMIPC_TIMEOUT` |
+
+### 配置
 
 ```c
-#include "shmipc/shmipc.h"
-
-SHMIPC_CONFIG_LOW_FREQ        // shm=8MB,  queue=32,  slice=4KB   — 低频控制消息
-SHMIPC_CONFIG_GENERAL         // shm=16MB, queue=64,  slice=16KB  — 通用 IPC（默认）
-SHMIPC_CONFIG_HIGH_THROUGHPUT // shm=64MB, queue=256, slice=64KB  — 高吞吐视频/音频
-
-// 自定义配置
-shmipc_config_t cfg = { .shm_size = 32u<<20, .event_queue_capacity = 128, .slice_size = 32768 };
+typedef struct {
+    uint32_t shm_size;             /* 共享内存总字节（对半分为 server_write / client_write） */
+    uint32_t event_queue_capacity; /* 每方向事件环容量，≤ 512 */
+    uint32_t slice_size;           /* 每个 slice 负载字节数 */
+} shmipc_config_t;
 ```
 
-**单次写入最大数据量：**
+**预设（只读全局量）：** `SHMIPC_CONFIG_LOW_FREQ`（8 MB / 32 / 4 KB）、`SHMIPC_CONFIG_GENERAL`（16 MB / 64 / 16 KB，客户端未调用 `set_config` 时的默认）、`SHMIPC_CONFIG_HIGH_THROUGHPUT`（64 MB / 256 / 64 KB）。
+
+**谁设置配置：** 仅**客户端**在 `shmipc_client_connect` **之前**调用 `shmipc_client_set_config`。服务端使用握手协商出的参数，无需再调 `set_config`。
+
+**单次写入最大 payload**（与内部 copy 写、多 slice 零拷贝共用同一几何上限，近似值）：
 
 | 预设 | 最大单次写入 |
 |------|------------|
@@ -167,90 +187,94 @@ shmipc_config_t cfg = { .shm_size = 32u<<20, .event_queue_capacity = 128, .slice
 | GENERAL | ~8 MB |
 | HIGH_THROUGHPUT | ~32 MB |
 
-### 写超时语义
+### 回调类型
 
-| `timeout_ms` 值 | 宏 | 行为 |
-|----------------|-----|------|
-| `-1` | `SHMIPC_TIMEOUT_NONBLOCKING` | buffer 满立即返回，丢弃本次写入 |
-| `0` | `SHMIPC_TIMEOUT_INFINITE` | 阻塞直到 buffer 有空间 |
-| `N > 0` | — | 最多等待 N 毫秒，超时返回 `SHMIPC_TIMEOUT` |
+| 类型 | 调用时机 | 说明 |
+|------|----------|------|
+| `shmipc_on_session_cb` | 服务端：新客户端连上；客户端：`connect` 成功后的回调 | 服务端第一个参数为 `shmipc_session_t*`，用于后续向该客户端发送。 |
+| `shmipc_on_data_cb` | 收到数据（拷贝路径） | `data` 仅在回调返回前有效。 |
+| `shmipc_on_data_zc_cb` | 收到数据（服务端 session，零拷贝） | 若与 `on_data` 同时注册，仅调用本回调；必须 `shmipc_buf_release`。 |
+| `shmipc_cli_on_data_zc_cb` | 收到数据（客户端，零拷贝） | 第一个参数为 `shmipc_client_t*`；必须 `shmipc_buf_release`。 |
+| `shmipc_on_disconnect_cb` | 连接断开 | 释放与该句柄关联的应用状态。 |
 
-### Server API
+### 服务端 API（`shmipc_server_*`）
 
-```c
-shmipc_server_t* shmipc_server_create(void);
-void             shmipc_server_destroy(shmipc_server_t*);
+| 函数 | 说明 |
+|------|------|
+| `shmipc_server_create()` | 创建服务端对象；失败返回 `NULL`。 |
+| `shmipc_server_destroy(server)` | 停止监听并销毁会话；可传 `NULL`。 |
+| `shmipc_server_set_context(server, ctx)` | 所有回调最后一个参数传入的上下文指针。 |
+| `shmipc_server_register_on_connected(server, cb)` | 有客户端连接时调用；从回调取得 `shmipc_session_t*` 再发送。 |
+| `shmipc_server_register_on_data(server, cb)` | **客户端→服务端** 接收（拷贝到用户态）。 |
+| `shmipc_server_register_on_data_zc(server, cb)` | **客户端→服务端** 零拷贝接收；与 `on_data` 同时注册时优先本回调。 |
+| `shmipc_server_register_on_disconnected(server, cb)` | 会话断开。 |
+| `shmipc_server_start(server, channel_name)` | 在 UDS 抽象命名空间监听；成功返回 `SHMIPC_OK`。 |
+| `shmipc_server_stop(server)` | 停止接受新连接并结束已有会话。 |
+| `shmipc_server_get_status(server, out)` | `is_running`、`connected_clients`。 |
+| `shmipc_server_set_async_dispatch(server, depth)` | `depth > 0` 时入队并由**独立线程**调用 `on_data` / `on_data_zc`；须在 **`start` 之前** 调用；`0` 为同步投递（默认）。 |
 
-void shmipc_server_set_context(shmipc_server_t*, void* ctx);
+### Session API（`shmipc_session_*`）——服务端向客户端发送
 
-// 注册回调
-void shmipc_server_register_on_connected   (shmipc_server_t*, shmipc_on_session_cb);
-void shmipc_server_register_on_data        (shmipc_server_t*, shmipc_on_data_cb);
-void shmipc_server_register_on_data_zc     (shmipc_server_t*, shmipc_on_data_zc_cb);   // 零拷贝接收
-void shmipc_server_register_on_disconnected(shmipc_server_t*, shmipc_on_disconnect_cb);
+在 `on_connected` 拿到 `shmipc_session_t*` 后再写；**不要**在 `start` 返回后立刻写。
 
-int  shmipc_server_start(shmipc_server_t*, const char* channel_name);
-void shmipc_server_stop (shmipc_server_t*);
+| 函数 | 说明 |
+|------|------|
+| `shmipc_session_write(session, data, len, timeout_ms)` | 将用户缓冲区拷贝进 SHM 并入队一条消息。 |
+| `shmipc_session_get_status(session, out)` | 该会话收发字节/消息数、`send_buffer_used_pct`（**server_write** 方向环占用）。 |
+| `shmipc_session_get_latency(session, out)` | **客户端→服务端** 方向接收延迟直方图（纳秒）；需已注册 `on_data` 或 `on_data_zc` 且会话有效。 |
+| `shmipc_session_reset_latency(session)` | 清空该会话统计。 |
 
-// 向指定 session 发送数据
-int  shmipc_session_write(shmipc_session_t*, const void* data, uint32_t len, int32_t timeout_ms);
+**写端零拷贝（`shmipc_wbuf_t`）：**
 
-// 写端零拷贝（单 slice，len <= slice_size）
-shmipc_wbuf_t* shmipc_session_alloc_buf   (shmipc_session_t*, uint32_t len);
-int            shmipc_session_send_buf    (shmipc_session_t*, shmipc_wbuf_t*, uint32_t len);
-void           shmipc_session_discard_buf (shmipc_session_t*, shmipc_wbuf_t*);
+| 函数 | 说明 |
+|------|------|
+| `shmipc_session_alloc_buf(session, len)` | 为长度 `len` 的出站消息预留 SHM（不超过最大 payload）。`len ≤ slice_size` 时用单 slice，否则为 slice 链（与 `writData` 一致）。失败返回 `NULL`。 |
+| `shmipc_session_send_buf(session, buf, len)` | 入队并**消耗** `buf`。**单 slice：** `len` ≤ `wbuf_capacity`。**多 slice：** `len` 须与 `alloc_buf` 时相同。 |
+| `shmipc_session_discard_buf(session, buf)` | 不发送并释放 slice。 |
 
-// 状态 & 延迟
-void shmipc_server_get_status    (shmipc_server_t*,  shmipc_server_status_t*);
-void shmipc_session_get_status   (shmipc_session_t*, shmipc_session_status_t*);
-void shmipc_session_get_latency  (shmipc_session_t*, shmipc_latency_stats_t*);
-void shmipc_session_reset_latency(shmipc_session_t*);
+辅助：`shmipc_wbuf_data`、`shmipc_wbuf_capacity`、`shmipc_wbuf_num_slices`、`shmipc_wbuf_slice_data`、`shmipc_wbuf_slice_bytes`。
 
-// 异步 dispatch（解耦慢回调与 ring buffer 消费）
-void shmipc_server_set_async_dispatch(shmipc_server_t*, uint32_t queue_depth);
-```
+### 客户端 API（`shmipc_client_*`）
 
-### Client API
+| 函数 | 说明 |
+|------|------|
+| `shmipc_client_create()` | 创建客户端对象。 |
+| `shmipc_client_destroy(client)` | 断开并销毁。 |
+| `shmipc_client_set_context(client, ctx)` | 回调上下文。 |
+| `shmipc_client_set_config(client, config)` | 在 **`connect` 之前** 设置 SHM/队列/slice。 |
+| `shmipc_client_register_on_connected(client, cb)` | 连接建立。 |
+| `shmipc_client_register_on_data(client, cb)` | **服务端→客户端** 接收（拷贝）。 |
+| `shmipc_client_register_on_data_zc(client, cb)` | **服务端→客户端** 零拷贝；第一个参数为 `shmipc_client_t*`。 |
+| `shmipc_client_register_on_disconnected(client, cb)` | 断开。 |
+| `shmipc_client_connect(client, channel_name)` | 连接；成功返回 `SHMIPC_OK`。 |
+| `shmipc_client_disconnect(client)` | 主动断开。 |
+| `shmipc_client_write(client, data, len, timeout_ms)` | **客户端→服务端** 拷贝写。 |
+| `shmipc_client_get_status(client, out)` | 含 **client_write** 方向 `send_buffer_used_pct`。 |
+| `shmipc_client_get_latency(client, out)` | **服务端→客户端** 接收延迟直方图。 |
+| `shmipc_client_reset_latency(client)` | 清空统计。 |
+| `shmipc_client_set_async_dispatch(client, depth)` | 与服务端相同；须在 **`connect` 之前** 调用。 |
 
-```c
-shmipc_client_t* shmipc_client_create(void);
-void             shmipc_client_destroy(shmipc_client_t*);
+**写端零拷贝（客户端）：** `shmipc_client_alloc_buf` / `send_buf` / `discard_buf`，与 session 侧一致。
 
-void shmipc_client_set_context(shmipc_client_t*, void* ctx);
-void shmipc_client_set_config (shmipc_client_t*, const shmipc_config_t*);
+### 零拷贝接收缓冲区（`shmipc_buf_t`）
 
-// 注册回调
-void shmipc_client_register_on_connected   (shmipc_client_t*, shmipc_on_session_cb);
-void shmipc_client_register_on_data        (shmipc_client_t*, shmipc_on_data_cb);
-void shmipc_client_register_on_data_zc     (shmipc_client_t*, shmipc_cli_on_data_zc_cb);
-void shmipc_client_register_on_disconnected(shmipc_client_t*, shmipc_on_disconnect_cb);
+仅在 `on_data_zc` / `shmipc_cli_on_data_zc_cb` 内使用：
 
-int  shmipc_client_connect   (shmipc_client_t*, const char* channel_name);
-void shmipc_client_disconnect(shmipc_client_t*);
+| 函数 | 说明 |
+|------|------|
+| `shmipc_buf_data(buf)` | 数据指针（单 slice 时可能直接指向 SHM）。 |
+| `shmipc_buf_len(buf)` | 长度。 |
+| `shmipc_buf_release(buf)` | **每条** 收到的 buffer **必须且仅能** 调用一次。 |
 
-int  shmipc_client_write(shmipc_client_t*, const void* data, uint32_t len, int32_t timeout_ms);
+### 状态结构体
 
-// 写端零拷贝
-shmipc_wbuf_t* shmipc_client_alloc_buf   (shmipc_client_t*, uint32_t len);
-int            shmipc_client_send_buf    (shmipc_client_t*, shmipc_wbuf_t*, uint32_t len);
-void           shmipc_client_discard_buf (shmipc_client_t*, shmipc_wbuf_t*);
+- **`shmipc_server_status_t`：** `is_running`、`connected_clients`。
+- **`shmipc_session_status_t`：** `is_alive`、该会话收发统计、`send_buffer_used_pct`（服务端→客户端发送环）。
+- **`shmipc_client_status_t`：** `is_connected`、收发统计、`send_buffer_used_pct`（客户端→服务端发送环）。
 
-// 状态 & 延迟
-void shmipc_client_get_status  (shmipc_client_t*, shmipc_client_status_t*);
-void shmipc_client_get_latency (shmipc_client_t*, shmipc_latency_stats_t*);
-void shmipc_client_reset_latency(shmipc_client_t*);
+### 延迟统计（`shmipc_latency_stats_t`）
 
-// 异步 dispatch
-void shmipc_client_set_async_dispatch(shmipc_client_t*, uint32_t queue_depth);
-```
-
-### 零拷贝接收缓冲区
-
-```c
-const void* shmipc_buf_data   (const shmipc_buf_t* buf);
-uint32_t    shmipc_buf_len    (const shmipc_buf_t* buf);
-void        shmipc_buf_release(shmipc_buf_t* buf);   // 必须恰好调用一次
-```
+字段（纳秒）：`count`、`min_ns`、`avg_ns`、`p50_ns`、`p90_ns`、`p99_ns`、`p999_ns`、`max_ns`。分位数为近似值（log₂ 分桶）。`count == 0` 表示尚无样本。
 
 ---
 
@@ -324,6 +348,21 @@ if (wb) {
 }
 ```
 
+### 多 slice 写端零拷贝（仍用 `alloc_buf` / `send_buf`）
+
+```c
+uint32_t total = 100000;
+shmipc_wbuf_t* wb = shmipc_session_alloc_buf(session, total);
+if (wb) {
+    for (uint32_t i = 0; i < shmipc_wbuf_num_slices(wb); i++) {
+        void*    seg = shmipc_wbuf_slice_data(wb, i);
+        uint32_t n   = shmipc_wbuf_slice_bytes(wb, i);
+        fill_segment(seg, n);
+    }
+    shmipc_session_send_buf(session, wb, total);
+}
+```
+
 ### 延迟监控
 
 ```c
@@ -362,11 +401,12 @@ cd shmipc/build
 ./shmipc_test1_s2c    2>/dev/null   # Server→Client 单向吞吐
 ./shmipc_test2_c2s    2>/dev/null   # Client→Server 单向吞吐
 ./shmipc_test3_duplex 2>/dev/null   # 全双工 + 多线程 + 混合模式
-./shmipc_test4_zc     2>/dev/null   # 零拷贝接收 API 验证
+./shmipc_test4_zc     2>/dev/null   # 零拷贝接收 + 写端 alloc_buf（C→S / S→C）
 ./shmipc_test5_latency              # 延迟监控 API 验证
+./shmipc_test7_dispatch             # 异步 dispatch（S→C 与 C→S）
 ```
 
-退出码 `0` = 全部 PASS，`1` = 有 FAIL。详细说明见 [`shmipc/tests/README.md`](shmipc/tests/README.md)。
+退出码 `0` = 全部 PASS，`1` = 有 FAIL。详细说明见 [`tests/README.md`](tests/README.md)。
 
 ### 性能参考（i5-12400，WSL2 Ubuntu 22.04）
 
@@ -405,4 +445,5 @@ target_link_libraries(my_native_lib PRIVATE shmipc)
 - **`on_data_zc` 优先级高于 `on_data`**，两者同时注册时只调用前者。
 - **`shmipc_buf_release` 必须恰好调用一次**，过多或遗漏均会导致内存泄漏或 SHM slice 耗尽。
 - **`alloc_buf` / `send_buf` 始终消耗句柄**，调用后不可再使用该指针。
+- **多 slice 时 `send_buf` 的 `len` 须与 `alloc_buf` 时的 `len` 一致**。
 - `channel_name` 为 Unix Domain Socket 抽象命名空间路径，建议 ≤ 32 字符，仅含字母、数字、下划线。

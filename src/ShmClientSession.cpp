@@ -473,31 +473,88 @@ void ShmClientSession::dispatchLoop() {
 
 /* ── Write-side zero-copy ────────────────────────────────────────── */
 
+static void free_slice_chain(ShmBufferList* list, uint32_t head) {
+    uint32_t cur = head;
+    while (cur != INVALID_INDEX) {
+        uint32_t n = get_slice(list, cur)->next;
+        free_slice(list, cur);
+        cur = n;
+    }
+}
+
 shmipc_wbuf_t* ShmClientSession::allocWriteBuf(uint32_t len) {
-    if (!mClientWriteBuf || !mConnected) return nullptr;
-    auto* list = &mClientWriteBuf->buffer_list;
-    if (len == 0 || len > list->slice_size) return nullptr;
+    if (!mClientWriteBuf || !mConnected || len == 0) return nullptr;
 
-    uint32_t idx = alloc_slice(list);
-    if (idx == INVALID_INDEX) return nullptr;
+    auto*    list       = &mClientWriteBuf->buffer_list;
+    uint32_t slice_size = list->slice_size;
 
-    auto* wb      = new shmipc_wbuf_t;
-    wb->data      = get_slice_data(get_slice(list, idx));
-    wb->capacity  = list->slice_size;
-    wb->slice_idx = idx;
-    wb->manager   = mClientWriteBuf;
+    if (len <= slice_size) {
+        uint32_t idx = alloc_slice(list);
+        if (idx == INVALID_INDEX) return nullptr;
+
+        auto* wb = new shmipc_wbuf_t{};
+        wb->data       = get_slice_data(get_slice(list, idx));
+        wb->capacity   = slice_size;
+        wb->slice_idx  = idx;
+        wb->num_slices = 1;
+        wb->seg_size   = slice_size;
+        wb->alloc_len  = len;
+        wb->manager    = mClientWriteBuf;
+        return wb;
+    }
+
+    uint32_t slices_needed = (len + slice_size - 1) / slice_size;
+    uint32_t first = INVALID_INDEX, prev = INVALID_INDEX, offset = 0;
+
+    for (uint32_t i = 0; i < slices_needed; ++i) {
+        uint32_t idx = alloc_slice(list);
+        if (idx == INVALID_INDEX) {
+            free_slice_chain(list, first);
+            return nullptr;
+        }
+        ShmBufferSlice* s = get_slice(list, idx);
+        uint32_t        seg = std::min(len - offset, slice_size);
+        s->length           = seg;
+        offset += seg;
+        if (prev != INVALID_INDEX)
+            get_slice(list, prev)->next = idx;
+        else
+            first = idx;
+        prev    = idx;
+        s->next = INVALID_INDEX;
+    }
+
+    if (first == INVALID_INDEX) return nullptr;
+
+    auto* wb = new shmipc_wbuf_t{};
+    wb->data       = get_slice_data(get_slice(list, first));
+    wb->capacity   = len;
+    wb->slice_idx  = first;
+    wb->num_slices = slices_needed;
+    wb->seg_size   = slice_size;
+    wb->alloc_len  = len;
+    wb->manager    = mClientWriteBuf;
     return wb;
 }
 
 int ShmClientSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
     if (!buf) return SHMIPC_ERR;
     if (!mClientWriteBuf || !mConnected || len == 0 || len > buf->capacity) {
-        discardWriteBuf(buf); return SHMIPC_ERR;
+        discardWriteBuf(buf);
+        return SHMIPC_ERR;
+    }
+    if (buf->num_slices > 1 && len != buf->alloc_len) {
+        discardWriteBuf(buf);
+        return SHMIPC_ERR;
     }
 
-    ShmBufferSlice* s = get_slice(&buf->manager->buffer_list, buf->slice_idx);
-    s->length = len;
-    s->next   = INVALID_INDEX;
+    auto* list = &mClientWriteBuf->buffer_list;
+
+    if (buf->num_slices == 1) {
+        ShmBufferSlice* s = get_slice(list, buf->slice_idx);
+        s->length         = len;
+        s->next           = INVALID_INDEX;
+    }
 
     bool ok;
     {
@@ -505,18 +562,33 @@ int ShmClientSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
         ok = shm_queue_commit(&mClientWriteBuf->io_queue, buf->slice_idx, len);
     }
 
-    if (!ok) free_slice(&mClientWriteBuf->buffer_list, buf->slice_idx);
-    else { mBytesSent.fetch_add(len,std::memory_order_relaxed);
-           mMsgsSent .fetch_add(1,  std::memory_order_relaxed); }
+    if (!ok) {
+        if (buf->num_slices > 1)
+            free_slice_chain(list, buf->slice_idx);
+        else
+            free_slice(list, buf->slice_idx);
+    } else {
+        mBytesSent.fetch_add(len, std::memory_order_relaxed);
+        mMsgsSent.fetch_add(1, std::memory_order_relaxed);
+    }
     delete buf;
 
-    if (ok) { notifyServerOfClientWrite(); return SHMIPC_OK; }
+    if (ok) {
+        notifyServerOfClientWrite();
+        return SHMIPC_OK;
+    }
     return SHMIPC_ERR;
 }
 
 void ShmClientSession::discardWriteBuf(shmipc_wbuf_t* buf) {
     if (!buf) return;
-    if (buf->manager) free_slice(&buf->manager->buffer_list, buf->slice_idx);
+    if (buf->manager) {
+        auto* list = &buf->manager->buffer_list;
+        if (buf->num_slices > 1)
+            free_slice_chain(list, buf->slice_idx);
+        else
+            free_slice(list, buf->slice_idx);
+    }
     delete buf;
 }
 

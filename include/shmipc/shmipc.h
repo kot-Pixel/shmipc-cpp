@@ -226,26 +226,25 @@ SHMIPC_API void shmipc_client_reset_latency(shmipc_client_t* client);
 /* ================================================================
  *  Write-side zero-copy API  (Feature 6)
  *
- *  Allocate a writable SHM slice, fill it in-place, then enqueue
- *  it with send_buf — eliminating the memcpy inside writData.
+ *  alloc_buf(len) allocates one or more SHM slices for a message of
+ *  up to len bytes (same chaining as writData when len > slice_size).
+ *  Fill via wbuf_data (first segment) and wbuf_slice_data / wbuf_slice_bytes
+ *  for additional segments, then send_buf(buf, actual_len).
  *
- *  Constraint: len <= configured slice_size. For larger payloads
- *  use the regular shmipc_session_write / shmipc_client_write.
- *
- *  Ownership rule: both send_buf and discard_buf ALWAYS consume
- *  the handle. Never use buf after calling either function.
+ *  Ownership: send_buf and discard_buf ALWAYS consume the handle.
  * ================================================================ */
 typedef struct shmipc_wbuf shmipc_wbuf_t;
 
 SHMIPC_API void*    shmipc_wbuf_data    (shmipc_wbuf_t* buf);
 SHMIPC_API uint32_t shmipc_wbuf_capacity(shmipc_wbuf_t* buf);
+SHMIPC_API uint32_t shmipc_wbuf_num_slices(shmipc_wbuf_t* buf);
+SHMIPC_API void*    shmipc_wbuf_slice_data (shmipc_wbuf_t* buf, uint32_t slice_index);
+SHMIPC_API uint32_t shmipc_wbuf_slice_bytes(shmipc_wbuf_t* buf, uint32_t slice_index);
 
-/* Server session */
 SHMIPC_API shmipc_wbuf_t* shmipc_session_alloc_buf   (shmipc_session_t*, uint32_t len);
 SHMIPC_API int             shmipc_session_send_buf    (shmipc_session_t*, shmipc_wbuf_t*, uint32_t len);
 SHMIPC_API void            shmipc_session_discard_buf (shmipc_session_t*, shmipc_wbuf_t*);
 
-/* Client */
 SHMIPC_API shmipc_wbuf_t* shmipc_client_alloc_buf   (shmipc_client_t*, uint32_t len);
 SHMIPC_API int             shmipc_client_send_buf    (shmipc_client_t*, shmipc_wbuf_t*, uint32_t len);
 SHMIPC_API void            shmipc_client_discard_buf (shmipc_client_t*, shmipc_wbuf_t*);

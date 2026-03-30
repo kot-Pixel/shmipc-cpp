@@ -294,12 +294,42 @@ uint32_t shmipc_wbuf_capacity(shmipc_wbuf_t* buf) {
     return buf ? buf->capacity : 0u;
 }
 
+uint32_t shmipc_wbuf_num_slices(shmipc_wbuf_t* buf) {
+    return buf ? buf->num_slices : 0u;
+}
+
+void* shmipc_wbuf_slice_data(shmipc_wbuf_t* buf, uint32_t slice_index) {
+    if (!buf || slice_index >= buf->num_slices) return nullptr;
+    auto* list = &buf->manager->buffer_list;
+    uint32_t cur = buf->slice_idx;
+    for (uint32_t k = 0; k < slice_index && cur != INVALID_INDEX; ++k)
+        cur = get_slice(list, cur)->next;
+    if (cur == INVALID_INDEX) return nullptr;
+    return get_slice_data(get_slice(list, cur));
+}
+
+uint32_t shmipc_wbuf_slice_bytes(shmipc_wbuf_t* buf, uint32_t slice_index) {
+    if (!buf || slice_index >= buf->num_slices) return 0u;
+    uint32_t offset = slice_index * buf->seg_size;
+    if (offset >= buf->alloc_len) return 0u;
+    uint32_t rem = buf->alloc_len - offset;
+    return rem < buf->seg_size ? rem : buf->seg_size;
+}
+
 shmipc_wbuf_t* shmipc_session_alloc_buf(shmipc_session_t* s, uint32_t len) {
     if (!s || s->type != shmipc_session::SERVER_SIDE) return nullptr;
     return s->server_session->allocWriteBuf(len);
 }
 int shmipc_session_send_buf(shmipc_session_t* s, shmipc_wbuf_t* buf, uint32_t len) {
-    if (!s || s->type != shmipc_session::SERVER_SIDE) { if (buf) s->server_session->discardWriteBuf(buf); return SHMIPC_ERR; }
+    if (!s || s->type != shmipc_session::SERVER_SIDE) {
+        if (s && buf) {
+            if (s->type == shmipc_session::SERVER_SIDE)
+                s->server_session->discardWriteBuf(buf);
+            else if (s->type == shmipc_session::CLIENT_SIDE)
+                s->client_session->discardWriteBuf(buf);
+        }
+        return SHMIPC_ERR;
+    }
     return s->server_session->sendWriteBuf(buf, len);
 }
 void shmipc_session_discard_buf(shmipc_session_t* s, shmipc_wbuf_t* buf) {
@@ -312,7 +342,10 @@ shmipc_wbuf_t* shmipc_client_alloc_buf(shmipc_client_t* c, uint32_t len) {
     return c->impl.session()->allocWriteBuf(len);
 }
 int shmipc_client_send_buf(shmipc_client_t* c, shmipc_wbuf_t* buf, uint32_t len) {
-    if (!c || !c->impl.session()) { if (c && c->impl.session()) c->impl.session()->discardWriteBuf(buf); return SHMIPC_ERR; }
+    if (!c || !c->impl.session()) {
+        if (c && c->impl.session() && buf) c->impl.session()->discardWriteBuf(buf);
+        return SHMIPC_ERR;
+    }
     return c->impl.session()->sendWriteBuf(buf, len);
 }
 void shmipc_client_discard_buf(shmipc_client_t* c, shmipc_wbuf_t* buf) {

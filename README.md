@@ -13,7 +13,7 @@ A high-performance, bidirectional IPC framework built on shared memory (`memfd` 
 | Feature | Description |
 |---------|-------------|
 | **Zero-copy receive** | Single-slice messages borrow the SHM pointer directly — no heap copy in `on_data_zc` |
-| **Zero-copy write** | `alloc_buf` / `send_buf` lets callers fill SHM slices in-place, skipping the internal `memcpy` |
+| **Zero-copy write** | `alloc_buf` / `send_buf` — one or many slices per message; fill SHM in-place, skipping internal `memcpy` |
 | **futex notification** | `FUTEX_WAIT/WAKE` replaces Unix Domain Socket data signals, reducing context switches |
 | **Full-duplex** | Independent `server_write` / `client_write` ring buffers — no contention in either direction |
 | **Crash awareness** | UDS socket closure triggers `on_disconnected` and shared-memory cleanup automatically |
@@ -43,8 +43,9 @@ shmipc/
 │   ├── test1_s2c.c       ← Server→Client benchmark
 │   ├── test2_c2s.c       ← Client→Server benchmark
 │   ├── test3_duplex.c    ← Full-duplex / multi-thread / mixed modes
-│   ├── test4_zc.c        ← Zero-copy receive API validation
+│   ├── test4_zc.c        ← Zero-copy receive + write alloc_buf/send_buf (incl. multi-slice)
 │   ├── test5_latency.c   ← Latency monitoring API validation
+│   ├── test7_dispatch.c  ← Async dispatch (slow callback + burst)
 │   └── README.md
 ├── CMakeLists.txt
 └── install.sh            ← one-shot dist/ packager
@@ -78,7 +79,7 @@ cmake --build build -j$(nproc)
 Outputs:
 - `build/libshmipc.a` — static library
 - `build/shmipc_server`, `build/shmipc_client` — example binaries
-- `build/shmipc_test1_s2c` … `build/shmipc_test5_latency` — test binaries
+- `build/shmipc_test1_s2c` … `build/shmipc_test7_dispatch` — test binaries
 
 ### CMake options
 
@@ -206,20 +207,39 @@ dist/
 
 ## API Reference
 
-### Configuration presets
+Public API lives in a single header: `#include "shmipc/shmipc.h"`. Opaque handles: `shmipc_server_t`, `shmipc_client_t`, `shmipc_session_t` (per connected client on the server), `shmipc_buf_t` (receive, zero-copy path), `shmipc_wbuf_t` (write zero-copy buffer: one or more SHM slices). Callbacks run on internal library threads (consumer / optional dispatch); do not block for long unless you use async dispatch.
+
+### Return codes and macros
+
+| Symbol | Value | Meaning |
+|--------|-------|---------|
+| `SHMIPC_OK` | `0` | Success |
+| `SHMIPC_ERR` | `-1` | Failure (invalid argument, not connected, queue full, etc.) |
+| `SHMIPC_TIMEOUT` | `-2` | Timed wait expired (`timeout_ms` > 0) |
+
+Write APIs accept `timeout_ms` using:
+
+| `timeout_ms` | Macro | Behaviour |
+|--------------|-------|-----------|
+| `-1` | `SHMIPC_TIMEOUT_NONBLOCKING` | Drop immediately if the outbound ring is full |
+| `0` | `SHMIPC_TIMEOUT_INFINITE` | Block until space is available |
+| `N > 0` | — | Wait at most N ms; on timeout return `SHMIPC_TIMEOUT` |
+
+### Configuration
 
 ```c
-#include "shmipc/shmipc.h"
-
-SHMIPC_CONFIG_LOW_FREQ        // shm=8MB,  queue=32,  slice=4KB   — low-frequency control
-SHMIPC_CONFIG_GENERAL         // shm=16MB, queue=64,  slice=16KB  — general IPC (default)
-SHMIPC_CONFIG_HIGH_THROUGHPUT // shm=64MB, queue=256, slice=64KB  — video / audio streams
-
-// Custom config
-shmipc_config_t cfg = { .shm_size = 32u<<20, .event_queue_capacity = 128, .slice_size = 32768 };
+typedef struct {
+    uint32_t shm_size;             /* total SHM bytes (split: server_write | client_write) */
+    uint32_t event_queue_capacity; /* ring slots per direction, ≤ 512 */
+    uint32_t slice_size;           /* payload bytes per slice */
+} shmipc_config_t;
 ```
 
-**Maximum single-write payload:**
+**Presets (read-only globals):** `SHMIPC_CONFIG_LOW_FREQ` (8 MB / 32 / 4 KB), `SHMIPC_CONFIG_GENERAL` (16 MB / 64 / 16 KB, default if client does not call `set_config`), `SHMIPC_CONFIG_HIGH_THROUGHPUT` (64 MB / 256 / 64 KB).
+
+**Who sets config:** Only the **client** calls `shmipc_client_set_config` **before** `shmipc_client_connect`. The server accepts the negotiated metadata from the client; it does not mirror `set_config`.
+
+**Maximum single-write payload** (approximate upper bound from region geometry; same for copy-write and multi-slice zero-copy):
 
 | Preset | Max payload |
 |--------|-------------|
@@ -227,105 +247,96 @@ shmipc_config_t cfg = { .shm_size = 32u<<20, .event_queue_capacity = 128, .slice
 | GENERAL | ~8 MB |
 | HIGH_THROUGHPUT | ~32 MB |
 
-### Write timeout semantics
+### Callback types
 
-| `timeout_ms` | Macro | Behaviour |
-|-------------|-------|-----------|
-| `-1` | `SHMIPC_TIMEOUT_NONBLOCKING` | Drop immediately if buffer full |
-| `0` | `SHMIPC_TIMEOUT_INFINITE` | Block until space is available |
-| `N > 0` | — | Wait at most N ms; returns `SHMIPC_TIMEOUT` |
+| Callback | When invoked | Notes |
+|----------|----------------|-------|
+| `shmipc_on_session_cb` | Client connected (server) or your client finished connect (client) | First argument is `shmipc_session_t*` (server) or passed as session for client-side registration; second is `ctx`. |
+| `shmipc_on_data_cb` | Inbound message (copying path) | `data` is valid only for the duration of the callback. |
+| `shmipc_on_data_zc_cb` | Inbound message (server session, zero-copy) | Prefer over `on_data` if both set. You must `shmipc_buf_release(buf)`. |
+| `shmipc_cli_on_data_zc_cb` | Inbound message (client, zero-copy) | Same release rule. |
+| `shmipc_on_disconnect_cb` | Session or client disconnected | Tear down app state tied to the handle. |
 
-### Server API
+### Server API (`shmipc_server_*`)
 
-```c
-shmipc_server_t* shmipc_server_create(void);
-void             shmipc_server_destroy(shmipc_server_t* server);
+| Function | Purpose |
+|----------|---------|
+| `shmipc_server_create()` | Allocate a server object. Returns non-NULL or `NULL` on OOM. |
+| `shmipc_server_destroy(server)` | Stops listening, destroys sessions, frees object. Safe on `NULL`. |
+| `shmipc_server_set_context(server, ctx)` | Opaque pointer passed as last argument to every callback. |
+| `shmipc_server_register_on_connected(server, cb)` | Called when a client connects; use `shmipc_session_t*` from `cb` for later writes. |
+| `shmipc_server_register_on_data(server, cb)` | Copying receive path for **client → server** data. |
+| `shmipc_server_register_on_data_zc(server, cb)` | Zero-copy receive; overrides `on_data` if both registered. |
+| `shmipc_server_register_on_disconnected(server, cb)` | Called when a session ends. |
+| `shmipc_server_start(server, channel_name)` | Listen on UDS abstract name; returns `SHMIPC_OK` or `SHMIPC_ERR`. |
+| `shmipc_server_stop(server)` | Stop accepting; existing sessions are torn down. |
+| `shmipc_server_get_status(server, out)` | Snapshot: `is_running`, `connected_clients`. |
+| `shmipc_server_set_async_dispatch(server, depth)` | If `depth > 0`, incoming messages are queued and delivered on a **dispatch thread**. Must be called **before** `start`. `0` = synchronous (default). |
 
-void shmipc_server_set_context(shmipc_server_t*, void* ctx);
+### Session API (`shmipc_session_*`) — server → client send
 
-// Callbacks
-void shmipc_server_register_on_connected   (shmipc_server_t*, shmipc_on_session_cb);
-void shmipc_server_register_on_data        (shmipc_server_t*, shmipc_on_data_cb);
-void shmipc_server_register_on_data_zc     (shmipc_server_t*, shmipc_on_data_zc_cb);   // zero-copy receive
-void shmipc_server_register_on_disconnected(shmipc_server_t*, shmipc_on_disconnect_cb);
+Obtain `shmipc_session_t*` from `on_connected`. Do **not** write before that callback fires.
 
-int  shmipc_server_start(shmipc_server_t*, const char* channel_name);
-void shmipc_server_stop (shmipc_server_t*);
+| Function | Purpose |
+|----------|---------|
+| `shmipc_session_write(session, data, len, timeout_ms)` | Copy `data` into shared memory and enqueue one message. |
+| `shmipc_session_get_status(session, out)` | Per-session bytes/messages sent and received, `send_buffer_used_pct` for **server_write** ring. |
+| `shmipc_session_get_latency(session, out)` | Histogram for **client → server** receive latency (nanoseconds). Requires `on_data` or `on_data_zc` registered and an active session. |
+| `shmipc_session_reset_latency(session)` | Clears samples for that session. |
 
-// Write to a specific client
-int  shmipc_session_write(shmipc_session_t*, const void* data, uint32_t len, int32_t timeout_ms);
+**Write-side zero-copy (`shmipc_wbuf_t`):**
 
-// Write-side zero-copy (single-slice, len <= slice_size)
-shmipc_wbuf_t* shmipc_session_alloc_buf   (shmipc_session_t*, uint32_t len);
-int            shmipc_session_send_buf    (shmipc_session_t*, shmipc_wbuf_t*, uint32_t len);
-void           shmipc_session_discard_buf (shmipc_session_t*, shmipc_wbuf_t*);
+| Function | Purpose |
+|----------|---------|
+| `shmipc_session_alloc_buf(session, len)` | Reserves SHM for an outbound message of `len` bytes (within max payload). Uses **one slice** if `len ≤ slice_size`, otherwise a **slice chain** (same layout as `writData`). Returns `NULL` on failure. |
+| `shmipc_session_send_buf(session, buf, len)` | Enqueues the message and **frees** `buf`. **Single-slice:** `len` ≤ `wbuf_capacity` (typically `slice_size`). **Multi-slice:** `len` must equal the `len` passed to `alloc_buf`. Returns `SHMIPC_OK` or `SHMIPC_ERR`. |
+| `shmipc_session_discard_buf(session, buf)` | Frees slice(s) without sending. |
 
-// Status & latency
-void shmipc_server_get_status  (shmipc_server_t*,  shmipc_server_status_t*);
-void shmipc_session_get_status (shmipc_session_t*, shmipc_session_status_t*);
-void shmipc_session_get_latency(shmipc_session_t*, shmipc_latency_stats_t*);
-void shmipc_session_reset_latency(shmipc_session_t*);
+Helpers: `shmipc_wbuf_data(buf)` → first segment; `shmipc_wbuf_capacity(buf)` → max bytes for `send_buf`; `shmipc_wbuf_num_slices`, `shmipc_wbuf_slice_data`, `shmipc_wbuf_slice_bytes` for segment `i` when `num_slices > 1`.
 
-// Async dispatch (decouple slow callbacks from ring-buffer draining)
-void shmipc_server_set_async_dispatch(shmipc_server_t*, uint32_t queue_depth);
-```
+### Client API (`shmipc_client_*`)
 
-### Client API
+| Function | Purpose |
+|----------|---------|
+| `shmipc_client_create()` | Allocate client object. |
+| `shmipc_client_destroy(client)` | Disconnects if needed, frees object. |
+| `shmipc_client_set_context(client, ctx)` | Opaque pointer for callbacks. |
+| `shmipc_client_set_config(client, config)` | **Before** `connect`. Chooses SHM size, queue capacity, slice size. |
+| `shmipc_client_register_on_connected(client, cb)` | Called when connection is up. |
+| `shmipc_client_register_on_data(client, cb)` | Copying receive for **server → client** data. |
+| `shmipc_client_register_on_data_zc(client, cb)` | Zero-copy receive; first argument is `shmipc_client_t*`. |
+| `shmipc_client_register_on_disconnected(client, cb)` | Called on disconnect. |
+| `shmipc_client_connect(client, channel_name)` | Returns `SHMIPC_OK` on success. |
+| `shmipc_client_disconnect(client)` | Closes session. |
+| `shmipc_client_write(client, data, len, timeout_ms)` | Client → server copy-write. |
+| `shmipc_client_get_status(client, out)` | Snapshot including `send_buffer_used_pct` for **client_write** ring. |
+| `shmipc_client_get_latency(client, out)` | Histogram for **server → client** receive latency. |
+| `shmipc_client_reset_latency(client)` | Clears samples. |
+| `shmipc_client_set_async_dispatch(client, depth)` | Same semantics as server; call **before** `connect`. |
 
-```c
-shmipc_client_t* shmipc_client_create(void);
-void             shmipc_client_destroy(shmipc_client_t*);
+**Write-side zero-copy (client):** `shmipc_client_alloc_buf`, `shmipc_client_send_buf`, `shmipc_client_discard_buf` — same semantics as the session functions above.
 
-void shmipc_client_set_context(shmipc_client_t*, void* ctx);
-void shmipc_client_set_config (shmipc_client_t*, const shmipc_config_t*);
+### Zero-copy receive buffer (`shmipc_buf_t`)
 
-// Callbacks
-void shmipc_client_register_on_connected   (shmipc_client_t*, shmipc_on_session_cb);
-void shmipc_client_register_on_data        (shmipc_client_t*, shmipc_on_data_cb);
-void shmipc_client_register_on_data_zc     (shmipc_client_t*, shmipc_cli_on_data_zc_cb);
-void shmipc_client_register_on_disconnected(shmipc_client_t*, shmipc_on_disconnect_cb);
+Used only inside `on_data_zc` / `shmipc_cli_on_data_zc_cb`:
 
-int  shmipc_client_connect   (shmipc_client_t*, const char* channel_name);
-void shmipc_client_disconnect(shmipc_client_t*);
+| Function | Purpose |
+|----------|---------|
+| `shmipc_buf_data(buf)` | Pointer to payload (may be in SHM for single-slice messages). |
+| `shmipc_buf_len(buf)` | Byte length. |
+| `shmipc_buf_release(buf)` | **Exactly once** per received buffer; returns the slice(s) to the pool. |
 
-int  shmipc_client_write(shmipc_client_t*, const void* data, uint32_t len, int32_t timeout_ms);
+If `on_data_zc` is registered, `on_data` is not called for the same message.
 
-// Write-side zero-copy
-shmipc_wbuf_t* shmipc_client_alloc_buf   (shmipc_client_t*, uint32_t len);
-int            shmipc_client_send_buf    (shmipc_client_t*, shmipc_wbuf_t*, uint32_t len);
-void           shmipc_client_discard_buf (shmipc_client_t*, shmipc_wbuf_t*);
+### Status structures
 
-// Status & latency
-void shmipc_client_get_status  (shmipc_client_t*, shmipc_client_status_t*);
-void shmipc_client_get_latency (shmipc_client_t*, shmipc_latency_stats_t*);
-void shmipc_client_reset_latency(shmipc_client_t*);
+- **`shmipc_server_status_t`:** `is_running`, `connected_clients`.
+- **`shmipc_session_status_t`:** `is_alive`, traffic counters for that client session, `send_buffer_used_pct` for server→client ring.
+- **`shmipc_client_status_t`:** `is_connected`, traffic counters, `send_buffer_used_pct` for client→server ring.
 
-// Async dispatch
-void shmipc_client_set_async_dispatch(shmipc_client_t*, uint32_t queue_depth);
-```
+### Latency statistics (`shmipc_latency_stats_t`)
 
-### Zero-copy receive buffer
-
-```c
-const void* shmipc_buf_data   (const shmipc_buf_t* buf);
-uint32_t    shmipc_buf_len    (const shmipc_buf_t* buf);
-void        shmipc_buf_release(shmipc_buf_t* buf);   // MUST be called exactly once
-```
-
-### Latency stats
-
-```c
-typedef struct {
-    uint64_t count;    // total messages sampled
-    uint64_t min_ns;   // minimum latency (ns)
-    uint64_t avg_ns;   // mean latency (ns)
-    uint64_t p50_ns;   // 50th percentile (ns)
-    uint64_t p90_ns;   // 90th percentile (ns)
-    uint64_t p99_ns;   // 99th percentile (ns)
-    uint64_t p999_ns;  // 99.9th percentile (ns)
-    uint64_t max_ns;   // maximum latency (ns)
-} shmipc_latency_stats_t;
-```
+Fields (all nanoseconds): `count`, `min_ns`, `avg_ns`, `p50_ns`, `p90_ns`, `p99_ns`, `p999_ns`, `max_ns`. Percentiles are approximate (log₂ buckets). `count == 0` means no samples yet.
 
 ---
 
@@ -399,6 +410,21 @@ if (wb) {
 }
 ```
 
+### Multi-slice write zero-copy (same `alloc_buf` / `send_buf`)
+
+```c
+uint32_t total = 100000;
+shmipc_wbuf_t* wb = shmipc_session_alloc_buf(session, total);
+if (wb) {
+    for (uint32_t i = 0; i < shmipc_wbuf_num_slices(wb); i++) {
+        void*    seg = shmipc_wbuf_slice_data(wb, i);
+        uint32_t n   = shmipc_wbuf_slice_bytes(wb, i);
+        fill_segment(seg, n);
+    }
+    shmipc_session_send_buf(session, wb, total);
+}
+```
+
 ### Latency monitoring
 
 ```c
@@ -428,11 +454,12 @@ cd shmipc/build
 ./shmipc_test1_s2c    2>/dev/null   # Server→Client throughput
 ./shmipc_test2_c2s    2>/dev/null   # Client→Server throughput
 ./shmipc_test3_duplex 2>/dev/null   # Full-duplex + multi-thread + mixed modes
-./shmipc_test4_zc     2>/dev/null   # Zero-copy receive API
+./shmipc_test4_zc     2>/dev/null   # Zero-copy recv + write alloc_buf (C→S / S→C)
 ./shmipc_test5_latency              # Latency monitoring API
+./shmipc_test7_dispatch             # Async dispatch (S→C and C→S)
 ```
 
-Exit code `0` = all PASS, `1` = failure. See [`shmipc/tests/README.md`](shmipc/tests/README.md) for detailed descriptions.
+Exit code `0` = all PASS, `1` = failure. See [`tests/README.md`](tests/README.md) for detailed descriptions.
 
 ### Performance reference (i5-12400, WSL2 Ubuntu 22.04)
 
@@ -471,4 +498,5 @@ target_link_libraries(my_native_lib PRIVATE shmipc)
 - **`on_data_zc` takes priority** over `on_data` when both are registered.
 - **`shmipc_buf_release` must be called exactly once** for every `shmipc_buf_t*` received via `on_data_zc`.
 - **`alloc_buf` / `send_buf` always consume the handle** — never use the pointer after calling either function.
+- **Multi-slice `send_buf`:** when `alloc_buf` used more than one slice, **`send_buf(..., len)` must use the same `len` as in `alloc_buf`**.
 - `channel_name` is a Unix Domain Socket abstract namespace path. Keep it ≤ 32 characters (letters, digits, underscores).
