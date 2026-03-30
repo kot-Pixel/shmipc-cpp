@@ -400,9 +400,17 @@ int ShmServerSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
     }
 
     bool ok;
+    bool wake_consumer = false;
     {
         std::lock_guard<std::mutex> g(mWriteMutex);
         ok = shm_queue_commit(&mServerWriteBuf->io_queue, buf->slice_idx, len);
+        if (ok) {
+            /* Must match tryWriteOnce: consumer thread only drains when WORKING_FLAG
+             * is set; wake only on 0→1 transition. */
+            uint32_t prev = mServerWriteBuf->io_queue.workingFlags.fetch_or(
+                WORKING_FLAG, std::memory_order_acq_rel);
+            wake_consumer = (prev & WORKING_FLAG) == 0;
+        }
     }
 
     if (!ok) {
@@ -417,7 +425,7 @@ int ShmServerSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
     delete buf;
 
     if (ok) {
-        dataSyncServerWrite();
+        if (wake_consumer) dataSyncServerWrite();
         return SHMIPC_OK;
     }
     return SHMIPC_ERR;
