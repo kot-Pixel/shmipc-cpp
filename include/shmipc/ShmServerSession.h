@@ -6,6 +6,7 @@
 #include <mutex>
 #include <memory>
 #include <functional>
+#include <vector>
 
 #include "ShmProtocolHandler.h"
 #include "ShmMessageQueue.h"
@@ -24,9 +25,12 @@ struct ShmSessionCallbacks {
     std::function<void(void* /*session*/, shmipc_buf_t* /*buf*/)> onDataZc;
     std::function<void(void* /*session*/)> onDisconnected;
     /* If > 0, incoming messages are placed in a bounded dispatch queue and
-     * delivered to on_data/on_data_zc by a dedicated thread, decoupling
-     * ring-buffer draining from slow application callbacks. */
-    uint32_t asyncDispatchDepth = 0;
+     * delivered to on_data/on_data_zc by dispatch threads, decoupling
+     * ring-buffer draining from slow application callbacks.
+     * asyncDispatchThreads == 0 or 1 → serial (preserves order).
+     * asyncDispatchThreads >  1      → concurrent (thread pool, no ordering). */
+    uint32_t asyncDispatchDepth   = 0;
+    uint32_t asyncDispatchThreads = 1;
 };
 
 class ShmServerSession {
@@ -123,8 +127,8 @@ private:
     void stopClientWriteConsumer();
 
     /* Async dispatch: deliver queued shmipc_buf_t* items to callbacks. */
-    std::unique_ptr<ShmDispatchQueue> mDispatchQueue;
-    std::unique_ptr<std::thread>      mDispatchThread;
+    std::unique_ptr<ShmDispatchQueue>             mDispatchQueue;
+    std::vector<std::unique_ptr<std::thread>>     mDispatchThreads;
     void startDispatch();
     void stopDispatch();
     void dispatchLoop();

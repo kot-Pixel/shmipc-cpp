@@ -250,18 +250,27 @@ SHMIPC_API int             shmipc_client_send_buf    (shmipc_client_t*, shmipc_w
 SHMIPC_API void            shmipc_client_discard_buf (shmipc_client_t*, shmipc_wbuf_t*);
 
 /* ================================================================
- *  Async dispatch  (Feature 7)
+ *  Dispatch configuration  (Feature 7)
  *
- *  When depth > 0, incoming SHM messages are decoded and placed in
- *  a bounded queue by the consumer thread.  A separate dispatch
- *  thread calls on_data / on_data_zc, so a slow callback never
- *  stalls the ring-buffer drain.
- *
+ *  Controls how incoming SHM messages are delivered to callbacks.
  *  Must be called before start() / connect().
- *  depth = 0 disables async dispatch (default, synchronous).
+ *
+ *  shmipc_*_set_async_dispatch(depth):
+ *      Legacy API.  depth > 0 enables a single serial dispatch thread
+ *      (preserves message order).  depth = 0 disables (synchronous).
+ *
+ *  shmipc_*_set_dispatch(depth, threads):
+ *      Full control.  depth > 0 enables a dispatch queue of that size.
+ *        threads == 0 or 1 → serial dispatch   (preserves message order)
+ *        threads >  1      → concurrent dispatch (thread pool, no ordering,
+ *                             one slow callback does not block others)
+ *      depth = 0 disables async dispatch regardless of threads.
  * ================================================================ */
 SHMIPC_API void shmipc_server_set_async_dispatch(shmipc_server_t* server, uint32_t depth);
 SHMIPC_API void shmipc_client_set_async_dispatch(shmipc_client_t* client, uint32_t depth);
+
+SHMIPC_API void shmipc_server_set_dispatch(shmipc_server_t* server, uint32_t depth, uint32_t threads);
+SHMIPC_API void shmipc_client_set_dispatch(shmipc_client_t* client, uint32_t depth, uint32_t threads);
 
 /* Data sending — same timeout_ms semantics as shmipc_session_write */
 SHMIPC_API int shmipc_client_write(shmipc_client_t* client, const void* data, uint32_t len,

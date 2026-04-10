@@ -26,7 +26,7 @@ tests/
 ├── test3_duplex.c     — 全双工 + 多写线程 + 混合模式测试
 ├── test4_zc.c         — 接收侧 on_data_zc；写侧 alloc_buf/send_buf（含多 slice）；吞吐对比
 ├── test5_latency.c    — 延迟直方图与 reset_latency
-└── test7_dispatch.c   — 异步 dispatch：`set_async_dispatch` + 慢回调 + 突发发送
+└── test7_dispatch.c   — Dispatch：串行（保序）+ 并发线程池（不保序）
 ```
 
 ---
@@ -152,7 +152,7 @@ GENERAL preset，3 种非对称 Pair（4KB↔1MB，64KB↔64KB，1MB↔4KB）。
 |------|------|
 | **test4_zc** | 接收：`on_data_zc` 单 slice 借用 SHM，大于 slice 时 heap 回退；写：`alloc_buf`/`send_buf`（含多 slice）C2S/S2C；完整性 + 吞吐 |
 | **test5_latency** | `get_latency` / `reset_latency`；S→C 与 C→S 直方图合理性 |
-| **test7_dispatch** | **异步 dispatch 专项**：`shmipc_*_set_async_dispatch(64)` 在 `start`/`connect` 之前启用；接收端 `on_data` 每次约 **1.2 ms** 休眠，对端 **连续突发 48 条** 小消息（64B 负载）。**[A] S→C** 测客户端 dispatch；**[B] C→S** 测服务端 dispatch。校验 `recv == 48`、**seq 严格递增**、`STOP` 哨兵。退出码 `0` = `overall: PASS`。 |
+| **test7_dispatch** | **Dispatch 专项**：对端 **连续突发 48 条** 小消息（64B 负载），接收端 `on_data` 每次约 **1.2 ms** 休眠。**[A] S→C 串行** `set_async_dispatch(64)` 客户端 1 线程，验证 `recv == 48` + **seq 严格递增**。**[B] C→S 串行** 服务端同理。**[C] S→C 并发** `set_dispatch(64, 4)` 客户端 4 线程池，验证 `recv == 48`（不要求顺序）。**[D] C→S 并发** 服务端 4 线程池同理。退出码 `0` = `overall: PASS`。 |
 
 ---
 

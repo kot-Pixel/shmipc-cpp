@@ -46,6 +46,10 @@ public:
     void setOnDisconnected      (std::function<void(ShmServerSession*)> cb);
     void setAsyncDispatchDepth  (uint32_t depth)
         { mSessionCallbacks.asyncDispatchDepth = depth; }
+    void setDispatch(uint32_t depth, uint32_t threads) {
+        mSessionCallbacks.asyncDispatchDepth   = depth;
+        mSessionCallbacks.asyncDispatchThreads = threads;
+    }
 
 
     std::vector<ShmServerSession*> getAllSessions();

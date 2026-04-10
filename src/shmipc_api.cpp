@@ -353,7 +353,7 @@ void shmipc_client_discard_buf(shmipc_client_t* c, shmipc_wbuf_t* buf) {
 }
 
 /* ================================================================
- *  Async dispatch (Feature 7)
+ *  Dispatch configuration (Feature 7)
  * ================================================================ */
 
 void shmipc_server_set_async_dispatch(shmipc_server_t* srv, uint32_t depth) {
@@ -362,6 +362,14 @@ void shmipc_server_set_async_dispatch(shmipc_server_t* srv, uint32_t depth) {
 
 void shmipc_client_set_async_dispatch(shmipc_client_t* cli, uint32_t depth) {
     if (cli && cli->impl.session()) cli->impl.session()->setAsyncDispatchDepth(depth);
+}
+
+void shmipc_server_set_dispatch(shmipc_server_t* srv, uint32_t depth, uint32_t threads) {
+    if (srv) srv->impl.setDispatch(depth, threads);
+}
+
+void shmipc_client_set_dispatch(shmipc_client_t* cli, uint32_t depth, uint32_t threads) {
+    if (cli && cli->impl.session()) cli->impl.session()->setDispatch(depth, threads);
 }
 
 } // extern "C"

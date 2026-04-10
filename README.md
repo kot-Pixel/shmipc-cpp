@@ -18,7 +18,7 @@ A high-performance, bidirectional IPC framework built on shared memory (`memfd` 
 | **Full-duplex** | Independent `server_write` / `client_write` ring buffers — no contention in either direction |
 | **Crash awareness** | UDS socket closure triggers `on_disconnected` and shared-memory cleanup automatically |
 | **Back-pressure** | Three write modes: blocking, non-blocking (drop), timed (up to N ms) |
-| **Async dispatch** | Optional decoupled dispatch thread so slow `on_data` callbacks never stall ring-buffer draining |
+| **Async dispatch** | Serial (preserves order) or concurrent (thread pool, no ordering) dispatch — slow `on_data` callbacks never stall ring-buffer draining |
 | **Latency monitoring** | Per-session P50/P90/P99/P99.9 delivery-latency histograms with `get_latency` / `reset_latency` |
 | **Status API** | Real-time counters: bytes/messages sent & received, send-buffer fullness % |
 | **Three presets** | `LOW_FREQ` / `GENERAL` / `HIGH_THROUGHPUT` — ready to use out of the box |
@@ -45,7 +45,7 @@ shmipc/
 │   ├── test3_duplex.c    ← Full-duplex / multi-thread / mixed modes
 │   ├── test4_zc.c        ← Zero-copy receive + write alloc_buf/send_buf (incl. multi-slice)
 │   ├── test5_latency.c   ← Latency monitoring API validation
-│   ├── test7_dispatch.c  ← Async dispatch (slow callback + burst)
+│   ├── test7_dispatch.c  ← Dispatch: serial + concurrent thread pool
 │   └── README.md
 ├── CMakeLists.txt
 └── install.sh            ← one-shot dist/ packager
@@ -271,7 +271,8 @@ typedef struct {
 | `shmipc_server_start(server, channel_name)` | Listen on UDS abstract name; returns `SHMIPC_OK` or `SHMIPC_ERR`. |
 | `shmipc_server_stop(server)` | Stop accepting; existing sessions are torn down. |
 | `shmipc_server_get_status(server, out)` | Snapshot: `is_running`, `connected_clients`. |
-| `shmipc_server_set_async_dispatch(server, depth)` | If `depth > 0`, incoming messages are queued and delivered on a **dispatch thread**. Must be called **before** `start`. `0` = synchronous (default). |
+| `shmipc_server_set_async_dispatch(server, depth)` | If `depth > 0`, incoming messages are queued and delivered on a **single dispatch thread** (serial, preserves order). Must be called **before** `start`. `0` = synchronous (default). |
+| `shmipc_server_set_dispatch(server, depth, threads)` | Full control: `threads ≤ 1` → serial (ordered); `threads > 1` → concurrent **thread pool** (unordered). Must be called **before** `start`. |
 
 ### Session API (`shmipc_session_*`) — server → client send
 
@@ -312,7 +313,8 @@ Helpers: `shmipc_wbuf_data(buf)` → first segment; `shmipc_wbuf_capacity(buf)` 
 | `shmipc_client_get_status(client, out)` | Snapshot including `send_buffer_used_pct` for **client_write** ring. |
 | `shmipc_client_get_latency(client, out)` | Histogram for **server → client** receive latency. |
 | `shmipc_client_reset_latency(client)` | Clears samples. |
-| `shmipc_client_set_async_dispatch(client, depth)` | Same semantics as server; call **before** `connect`. |
+| `shmipc_client_set_async_dispatch(client, depth)` | Same as server `set_async_dispatch`; call **before** `connect`. |
+| `shmipc_client_set_dispatch(client, depth, threads)` | Same as server `set_dispatch`; call **before** `connect`. |
 
 **Write-side zero-copy (client):** `shmipc_client_alloc_buf`, `shmipc_client_send_buf`, `shmipc_client_discard_buf` — same semantics as the session functions above.
 
@@ -437,12 +439,16 @@ printf("p50=%.1f µs  p99=%.1f µs  max=%.1f µs\n",
        st.p50_ns/1e3, st.p99_ns/1e3, st.max_ns/1e3);
 ```
 
-### Async dispatch
+### Dispatch modes
 
 ```c
-// Prevent slow on_data from stalling the ring-buffer consumer
-shmipc_server_set_async_dispatch(srv, 256);   // 256-slot queue, dedicated thread
+// Serial dispatch: preserves message order (single dispatch thread)
+shmipc_server_set_async_dispatch(srv, 256);    // legacy API, equivalent to set_dispatch(256, 1)
 shmipc_server_start(srv, "my_channel");
+
+// Concurrent dispatch: thread pool, no ordering, one slow callback won't block others
+shmipc_client_set_dispatch(cli, 128, 4);       // 128-slot queue, 4 dispatch threads
+shmipc_client_connect(cli, "my_channel");
 ```
 
 ---
@@ -456,7 +462,7 @@ cd shmipc/build
 ./shmipc_test3_duplex 2>/dev/null   # Full-duplex + multi-thread + mixed modes
 ./shmipc_test4_zc     2>/dev/null   # Zero-copy recv + write alloc_buf (C→S / S→C)
 ./shmipc_test5_latency              # Latency monitoring API
-./shmipc_test7_dispatch             # Async dispatch (S→C and C→S)
+./shmipc_test7_dispatch             # Dispatch: serial + concurrent (S→C and C→S)
 ```
 
 Exit code `0` = all PASS, `1` = failure. See [`tests/README.md`](tests/README.md) for detailed descriptions.
@@ -493,7 +499,7 @@ target_link_libraries(my_native_lib PRIVATE shmipc)
 ## Notes
 
 - **Concurrent writes are safe**, but NONBLOCKING writers on the same session may drop messages under contention. Use per-thread sessions for the best throughput.
-- **`on_data` / `on_data_zc` run on the consumer thread.** For slow processing, enable `set_async_dispatch` or copy data and process asynchronously.
+- **`on_data` / `on_data_zc` run on the consumer thread by default.** For slow processing, enable `set_dispatch` (serial or concurrent) or copy data and process asynchronously.
 - **`on_connected` must fire before writing** — do not write inside `shmipc_server_start` / `shmipc_client_connect`; wait for the callback.
 - **`on_data_zc` takes priority** over `on_data` when both are registered.
 - **`shmipc_buf_release` must be called exactly once** for every `shmipc_buf_t*` received via `on_data_zc`.

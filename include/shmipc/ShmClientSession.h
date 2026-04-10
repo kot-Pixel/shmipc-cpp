@@ -8,6 +8,7 @@
 #include <memory>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "ShmProtocolHandler.h"
 #include "ShmMessageQueue.h"
@@ -39,8 +40,14 @@ public:
     int            sendWriteBuf   (shmipc_wbuf_t* buf, uint32_t len);
     void           discardWriteBuf(shmipc_wbuf_t* buf);
 
-    /* Async dispatch depth; must be set before connect(). */
+    /* Async dispatch depth; must be set before connect().
+     * threads == 0 or 1 → serial dispatch (preserves message order).
+     * threads >  1       → concurrent dispatch (thread pool, no ordering). */
     void setAsyncDispatchDepth(uint32_t depth) { mAsyncDispatchDepth = depth; }
+    void setDispatch(uint32_t depth, uint32_t threads) {
+        mAsyncDispatchDepth   = depth;
+        mDispatchThreadCount  = threads;
+    }
 
     bool isConnected() const { return mConnected.load(std::memory_order_acquire); }
 
@@ -119,9 +126,10 @@ private:
     void stopServerWriteConsumer();
 
     /* Async dispatch */
-    uint32_t mAsyncDispatchDepth = 0;
-    std::unique_ptr<ShmDispatchQueue> mDispatchQueue;
-    std::unique_ptr<std::thread>      mDispatchThread;
+    uint32_t mAsyncDispatchDepth  = 0;
+    uint32_t mDispatchThreadCount = 1;
+    std::unique_ptr<ShmDispatchQueue>             mDispatchQueue;
+    std::vector<std::unique_ptr<std::thread>>     mDispatchThreads;
     void startDispatch();
     void stopDispatch();
     void dispatchLoop();

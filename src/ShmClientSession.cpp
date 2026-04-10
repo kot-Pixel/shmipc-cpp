@@ -447,14 +447,20 @@ void ShmClientSession::stopServerWriteConsumer() {
 
 void ShmClientSession::startDispatch() {
     mDispatchQueue.reset(new ShmDispatchQueue(mAsyncDispatchDepth));
-    mDispatchThread.reset(new std::thread(&ShmClientSession::dispatchLoop, this));
-    LOGI("ShmClientSession async dispatch started (depth=%u)", mAsyncDispatchDepth);
+    uint32_t n = (mDispatchThreadCount > 0) ? mDispatchThreadCount : 1;
+    mDispatchThreads.reserve(n);
+    for (uint32_t i = 0; i < n; ++i)
+        mDispatchThreads.emplace_back(
+            new std::thread(&ShmClientSession::dispatchLoop, this));
+    LOGI("ShmClientSession dispatch started (depth=%u threads=%u%s)",
+         mAsyncDispatchDepth, n, n > 1 ? " concurrent" : " serial");
 }
 
 void ShmClientSession::stopDispatch() {
     if (mDispatchQueue) mDispatchQueue->stop();
-    if (mDispatchThread && mDispatchThread->joinable()) mDispatchThread->join();
-    mDispatchThread.reset();
+    for (auto& t : mDispatchThreads)
+        if (t && t->joinable()) t->join();
+    mDispatchThreads.clear();
     mDispatchQueue.reset();
 }
 
