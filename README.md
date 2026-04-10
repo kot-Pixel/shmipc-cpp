@@ -5,7 +5,7 @@
 A high-performance, bidirectional IPC framework built on shared memory (`memfd` + `mmap`). Pure C public API, C++11 internals, supports Linux x86_64 and Android arm64-v8a.
 
 > **One-sentence pitch:** A futex-driven, zero-copy shared-memory pipe with a clean C API, designed for high-throughput, low-latency local IPC on Linux and Android.
-
+> **The design of this repository draws inspiration from**: https://github.com/cloudwego/shmipc-spec
 ---
 
 ## Features
