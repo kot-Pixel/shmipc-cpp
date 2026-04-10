@@ -10,20 +10,22 @@ A high-performance, bidirectional IPC framework built on shared memory (`memfd` 
 
 ## Features
 
-| Feature | Description |
-|---------|-------------|
-| **Zero-copy receive** | Single-slice messages borrow the SHM pointer directly — no heap copy in `on_data_zc` |
-| **Zero-copy write** | `alloc_buf` / `send_buf` — one or many slices per message; fill SHM in-place, skipping internal `memcpy` |
-| **futex notification** | `FUTEX_WAIT/WAKE` replaces Unix Domain Socket data signals, reducing context switches |
-| **Full-duplex** | Independent `server_write` / `client_write` ring buffers — no contention in either direction |
-| **Crash awareness** | UDS socket closure triggers `on_disconnected` and shared-memory cleanup automatically |
-| **Back-pressure** | Three write modes: blocking, non-blocking (drop), timed (up to N ms) |
-| **Async dispatch** | Serial (preserves order) or concurrent (thread pool, no ordering) dispatch — slow `on_data` callbacks never stall ring-buffer draining |
-| **Latency monitoring** | Per-session P50/P90/P99/P99.9 delivery-latency histograms with `get_latency` / `reset_latency` |
-| **Status API** | Real-time counters: bytes/messages sent & received, send-buffer fullness % |
-| **Three presets** | `LOW_FREQ` / `GENERAL` / `HIGH_THROUGHPUT` — ready to use out of the box |
-| **Pure C API** | No C++ symbols exposed; callable from C, JNI, FFI |
-| **Small footprint** | Android `.so` ≈ 420 KB (hidden symbols + `-Os` + strip) |
+
+| Feature                | Description                                                                                     |
+| ---------------------- | ----------------------------------------------------------------------------------------------- |
+| **Zero-copy receive**  | Single-slice messages borrow the SHM pointer directly — no heap copy in `on_data_zc`            |
+| **Zero-copy write**    | `alloc_buf` / `send_buf` — one or many slices per message; fill SHM in-place, skipping internal `memcpy` |
+| **futex notification** | `FUTEX_WAIT/WAKE` replaces Unix Domain Socket data signals, reducing context switches           |
+| **Full-duplex**        | Independent `server_write` / `client_write` ring buffers — no contention in either direction    |
+| **Crash awareness**    | UDS socket closure triggers `on_disconnected` and shared-memory cleanup automatically           |
+| **Back-pressure**      | Three write modes: blocking, non-blocking (drop), timed (up to N ms)                            |
+| **Async dispatch**     | Serial (preserves order) or concurrent (thread pool, no ordering) dispatch — slow `on_data` callbacks never stall ring-buffer draining |
+| **Latency monitoring** | Per-session P50/P90/P99/P99.9 delivery-latency histograms with `get_latency` / `reset_latency`  |
+| **Status API**         | Real-time counters: bytes/messages sent & received, send-buffer fullness %                      |
+| **Three presets**      | `LOW_FREQ` / `GENERAL` / `HIGH_THROUGHPUT` — ready to use out of the box                        |
+| **Pure C API**         | No C++ symbols exposed; callable from C, JNI, FFI                                               |
+| **Small footprint**    | Android `.so` ≈ 420 KB (hidden symbols + `-Os` + strip)                                         |
+
 
 ---
 
@@ -55,12 +57,14 @@ shmipc/
 
 ## Requirements
 
-| Component | Minimum | Notes |
-|-----------|---------|-------|
-| Linux kernel | 4.14+ | `memfd_create`, `futex` |
-| CMake | 3.14+ | |
-| GCC / Clang | GCC 7+ / Clang 6+ | C++11 |
-| Android NDK | r21+ | arm64-v8a cross-compilation |
+
+| Component    | Minimum           | Notes                       |
+| ------------ | ----------------- | --------------------------- |
+| Linux kernel | 4.14+             | `memfd_create`, `futex`     |
+| CMake        | 3.14+             |                             |
+| GCC / Clang  | GCC 7+ / Clang 6+ | C++11                       |
+| Android NDK  | r21+              | arm64-v8a cross-compilation |
+
 
 > On Windows, build inside **WSL (Ubuntu 22.04)**.
 
@@ -77,18 +81,21 @@ cmake --build build -j$(nproc)
 ```
 
 Outputs:
+
 - `build/libshmipc.a` — static library
 - `build/shmipc_server`, `build/shmipc_client` — example binaries
 - `build/shmipc_test1_s2c` … `build/shmipc_test7_dispatch` — test binaries
 
 ### CMake options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `SHMIPC_BUILD_SHARED` | `OFF` | `ON` builds `.so`, `OFF` builds `.a` |
-| `SHMIPC_BUILD_EXAMPLES` | `ON` | Build examples/ |
-| `SHMIPC_BUILD_TESTS` | `ON` | Build tests/ |
-| `SHMIPC_ANDROID_MIN_SIZE` | `ON` | Extra Android size flags for static workflows |
+
+| Option                  | Default | Description                          |
+| ----------------------- | ------- | ------------------------------------ |
+| `SHMIPC_BUILD_SHARED`   | `OFF`   | `ON` builds `.so`, `OFF` builds `.a` |
+| `SHMIPC_BUILD_EXAMPLES` | `ON`    | Build examples/                      |
+| `SHMIPC_BUILD_TESTS`    | `ON`    | Build tests/                         |
+| `SHMIPC_ANDROID_MIN_SIZE` | `ON`  | Extra Android size flags for static workflows |
+
 
 ```bash
 # Shared library only, no examples or tests
@@ -112,14 +119,14 @@ cmake --build build_arm64 -j$(nproc) --target shmipc
 
 ### Android arm64-v8a: test binaries
 
-Cross-compile tests with the NDK; keep **`SHMIPC_BUILD_TESTS=ON`** and usually **`SHMIPC_BUILD_SHARED=OFF`** so each test statically links `libshmipc.a` (one file per `adb push`).
+Cross-compile the integration tests the same way as the library, but keep **`SHMIPC_BUILD_TESTS=ON`** (default) and usually **`SHMIPC_BUILD_SHARED=OFF`** so each test executable statically links `libshmipc.a` — a single `adb push` per binary is enough.
 
-From **`shmipc/`**:
+From the **repository root** (parent of `shmipc/`):
 
 ```bash
-export ANDROID_NDK_HOME=/path/to/ndk
+export ANDROID_NDK_HOME=/path/to/ndk   # e.g. $HOME/android-ndk-r28b
 
-cmake -S . -B build_android_tests \
+cmake -S shmipc -B build_android_tests \
     -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
     -DANDROID_ABI=arm64-v8a \
     -DANDROID_PLATFORM=android-21 \
@@ -131,9 +138,16 @@ cmake -S . -B build_android_tests \
 cmake --build build_android_tests -j$(nproc)
 ```
 
-**Outputs:** `build_android_tests/libshmipc.a`, `build_android_tests/shmipc_test1_s2c`, …, `shmipc_test7_dispatch`.
+From inside **`shmipc/`**, use `-S .` instead of `-S shmipc` and the same options.
 
-**Run on device:**
+**Outputs:**
+
+- `build_android_tests/libshmipc.a`
+- `build_android_tests/shmipc_test1_s2c` … `build_android_tests/shmipc_test7_dispatch` (arm64 ELF)
+
+**Shared library + tests:** set `-DSHMIPC_BUILD_SHARED=ON`, build target `shmipc` then the test targets. Push **`libshmipc.so`** next to the test binary (or set `LD_LIBRARY_PATH` to its directory) when running on device.
+
+**Run on device (adb):**
 
 ```bash
 adb push build_android_tests/shmipc_test7_dispatch /data/local/tmp/
@@ -141,15 +155,15 @@ adb shell chmod 755 /data/local/tmp/shmipc_test7_dispatch
 adb shell /data/local/tmp/shmipc_test7_dispatch
 ```
 
-If you use **`SHMIPC_BUILD_SHARED=ON`**, push `libshmipc.so` next to the binary or set **`LD_LIBRARY_PATH`**. Try **`ANDROID_PLATFORM=android-24`** if you hit link/runtime issues on old APIs.
+Tests use `fork()`, pipes, and `/dev/null` like on Linux; they are intended for a normal **device `adb shell`** (root not required for `/data/local/tmp`). If linking or runtime fails on very old API levels, try `-DANDROID_PLATFORM=android-24`.
 
 ### Android static `.a` too large? (size-first build)
 
 `.a` archives keep object files and symbol metadata, so they are usually much larger than `.so`.
-For minimum static size, use `MinSizeRel` + section flags (`SHMIPC_ANDROID_MIN_SIZE=ON`):
+For minimum static size, use `MinSizeRel` + section flags (already enabled by `SHMIPC_ANDROID_MIN_SIZE=ON`):
 
 ```bash
-cmake -S . -B build_android_static_min \
+cmake -S shmipc -B build_android_static_min \
     -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
     -DANDROID_ABI=arm64-v8a \
     -DANDROID_PLATFORM=android-21 \
@@ -163,9 +177,11 @@ cmake --build build_android_static_min -j$(nproc) --target shmipc
 ```
 
 Important:
-- Use a **new build directory** when switching static/shared builds to avoid CMake cache reusing `SHMIPC_BUILD_SHARED`.
-- `cmake --install` defaults to `/usr/local` and may fail without permission. Use:
+- Use a **fresh build directory** for static vs shared (`build_android_static_min` vs `build_arm64`) to avoid CMake cache carrying over `SHMIPC_BUILD_SHARED`.
+- `cmake --install` defaults to `/usr/local` (may require root). Prefer:
   `cmake --install build_android_static_min --prefix ./dist_android_static_min`
+
+For final app size, shared-library integration is still the best path (`SHMIPC_BUILD_SHARED=ON`), because linker dead-stripping and exported-symbol control are more effective there.
 
 ---
 
@@ -183,11 +199,13 @@ bash install.sh --skip-x86       # arm64-v8a only
 
 **Environment variables:**
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ANDROID_NDK_HOME` | `~/android-ndk-r28b` | NDK root |
-| `DIST` | `./dist` | Output directory |
-| `BUILD_TYPE` | `Release` | `Release` or `Debug` |
+
+| Variable           | Default              | Description          |
+| ------------------ | -------------------- | -------------------- |
+| `ANDROID_NDK_HOME` | `~/android-ndk-r28b` | NDK root             |
+| `DIST`             | `./dist`             | Output directory     |
+| `BUILD_TYPE`       | `Release`            | `Release` or `Debug` |
+
 
 **Output layout:**
 
@@ -272,7 +290,7 @@ typedef struct {
 | `shmipc_server_stop(server)` | Stop accepting; existing sessions are torn down. |
 | `shmipc_server_get_status(server, out)` | Snapshot: `is_running`, `connected_clients`. |
 | `shmipc_server_set_async_dispatch(server, depth)` | If `depth > 0`, incoming messages are queued and delivered on a **single dispatch thread** (serial, preserves order). Must be called **before** `start`. `0` = synchronous (default). |
-| `shmipc_server_set_dispatch(server, depth, threads)` | Full control: `threads ≤ 1` → serial (ordered); `threads > 1` → concurrent **thread pool** (unordered). Must be called **before** `start`. |
+| `shmipc_server_set_dispatch(server, depth, threads)` | Full control: `threads ≤ 1` → serial (ordered); `threads > 1` → concurrent **thread pool** (unordered, one slow callback doesn't block others). Must be called **before** `start`. |
 
 ### Session API (`shmipc_session_*`) — server → client send
 
@@ -280,7 +298,7 @@ Obtain `shmipc_session_t*` from `on_connected`. Do **not** write before that cal
 
 | Function | Purpose |
 |----------|---------|
-| `shmipc_session_write(session, data, len, timeout_ms)` | Copy `data` into shared memory and enqueue one message. |
+| `shmipc_session_write(session, data, len, timeout_ms)` | Copy `data` into shared memory and enqueue one message. Main API for outbound messages. |
 | `shmipc_session_get_status(session, out)` | Per-session bytes/messages sent and received, `send_buffer_used_pct` for **server_write** ring. |
 | `shmipc_session_get_latency(session, out)` | Histogram for **client → server** receive latency (nanoseconds). Requires `on_data` or `on_data_zc` registered and an active session. |
 | `shmipc_session_reset_latency(session)` | Clears samples for that session. |
@@ -293,7 +311,7 @@ Obtain `shmipc_session_t*` from `on_connected`. Do **not** write before that cal
 | `shmipc_session_send_buf(session, buf, len)` | Enqueues the message and **frees** `buf`. **Single-slice:** `len` ≤ `wbuf_capacity` (typically `slice_size`). **Multi-slice:** `len` must equal the `len` passed to `alloc_buf`. Returns `SHMIPC_OK` or `SHMIPC_ERR`. |
 | `shmipc_session_discard_buf(session, buf)` | Frees slice(s) without sending. |
 
-Helpers: `shmipc_wbuf_data(buf)` → first segment; `shmipc_wbuf_capacity(buf)` → max bytes for `send_buf`; `shmipc_wbuf_num_slices`, `shmipc_wbuf_slice_data`, `shmipc_wbuf_slice_bytes` for segment `i` when `num_slices > 1`.
+Helpers: `shmipc_wbuf_data(buf)` → first segment; `shmipc_wbuf_capacity(buf)` → max bytes for `send_buf` (`slice_size` if single-slice, else total message length); `shmipc_wbuf_num_slices`, `shmipc_wbuf_slice_data`, `shmipc_wbuf_slice_bytes` for segment `i` when `num_slices > 1`.
 
 ### Client API (`shmipc_client_*`)
 
@@ -465,17 +483,21 @@ cd shmipc/build
 ./shmipc_test7_dispatch             # Dispatch: serial + concurrent (S→C and C→S)
 ```
 
-Exit code `0` = all PASS, `1` = failure. See [`tests/README.md`](tests/README.md) for detailed descriptions.
+Exit code `0` = all PASS, `1` = failure. See [`shmipc/tests/README.md`](shmipc/tests/README.md) for detailed descriptions.
+
+**Android:** cross-compile the same test executables with the NDK (subsection **Android arm64-v8a: test binaries** under **Building**), then `adb push` and run via `adb shell` as shown there.
 
 ### Performance reference (i5-12400, WSL2 Ubuntu 22.04)
 
-| Scenario | Throughput |
-|----------|-----------|
-| 1 thread, 1 MB payload, BLOCK | ~1.5 GB/s |
-| 8 threads, 1 MB payload, BLOCK | ~5.7 GB/s |
-| 1 thread, 64 KB payload | ~1.1 GB/s |
-| Full-duplex, 1 MB ↔ 4 KB, 8 threads | S→C ~6 GB/s, C→S ~0.4 GB/s |
-| S→C delivery latency (1 KB, GENERAL) | p50 ≈ 1.5 µs, p99 ≈ 12 µs |
+
+| Scenario                             | Throughput                 |
+| ------------------------------------ | -------------------------- |
+| 1 thread, 1 MB payload, BLOCK        | ~1.5 GB/s                  |
+| 8 threads, 1 MB payload, BLOCK       | ~5.7 GB/s                  |
+| 1 thread, 64 KB payload              | ~1.1 GB/s                  |
+| Full-duplex, 1 MB ↔ 4 KB, 8 threads  | S→C ~6 GB/s, C→S ~0.4 GB/s |
+| S→C delivery latency (1 KB, GENERAL) | p50 ≈ 1.5 µs, p99 ≈ 12 µs  |
+
 
 ---
 
@@ -499,10 +521,11 @@ target_link_libraries(my_native_lib PRIVATE shmipc)
 ## Notes
 
 - **Concurrent writes are safe**, but NONBLOCKING writers on the same session may drop messages under contention. Use per-thread sessions for the best throughput.
-- **`on_data` / `on_data_zc` run on the consumer thread by default.** For slow processing, enable `set_dispatch` (serial or concurrent) or copy data and process asynchronously.
-- **`on_connected` must fire before writing** — do not write inside `shmipc_server_start` / `shmipc_client_connect`; wait for the callback.
-- **`on_data_zc` takes priority** over `on_data` when both are registered.
-- **`shmipc_buf_release` must be called exactly once** for every `shmipc_buf_t*` received via `on_data_zc`.
-- **`alloc_buf` / `send_buf` always consume the handle** — never use the pointer after calling either function.
+- `**on_data` / `on_data_zc` run on the consumer thread by default.** For slow processing, enable `set_dispatch` (serial or concurrent) or copy data and process asynchronously.
+- `**on_connected` must fire before writing** — do not write inside `shmipc_server_start` / `shmipc_client_connect`; wait for the callback.
+- `**on_data_zc` takes priority** over `on_data` when both are registered.
+- `**shmipc_buf_release` must be called exactly once** for every `shmipc_buf_t`* received via `on_data_zc`.
+- `**alloc_buf` / `send_buf` always consume the handle** — never use the pointer after calling either function.
 - **Multi-slice `send_buf`:** when `alloc_buf` used more than one slice, **`send_buf(..., len)` must use the same `len` as in `alloc_buf`**.
 - `channel_name` is a Unix Domain Socket abstract namespace path. Keep it ≤ 32 characters (letters, digits, underscores).
+
