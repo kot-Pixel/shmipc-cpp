@@ -5,7 +5,7 @@
 基于共享内存（`memfd` + `mmap`）的高性能双向 IPC 框架，纯 C 公开 API，内部 C++11 实现，支持 Linux x86_64 与 Android arm64-v8a。
 
 > **一句话介绍：** 基于 futex 通知的零拷贝共享内存管道，提供简洁的 C 语言 API，专为 Linux 和 Android 上的高吞吐、低延迟本地 IPC 设计。
-
+> **本仓库设计部分参考了**：https://github.com/cloudwego/shmipc-spec
 ---
 
 ## 特性
