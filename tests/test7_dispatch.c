@@ -30,7 +30,7 @@ static int g_failed;
 typedef struct {
     uint32_t          expected_seq;
     volatile uint32_t recv;
-    volatile int      stop_seen;
+    int               stop_seen;   /* accessed via __atomic ops — see handlers */
     volatile int      bad_order;
 } order_ctx_t;
 
@@ -41,7 +41,9 @@ static void handle_rx_msg(order_ctx_t *c, const void *d, uint32_t l)
     memcpy(&seq, d, 4);
     memcpy(&plen, d + 4, 4);
     if (seq == STOP_SEQ) {
-        c->stop_seen = 1;
+        /* release store: the main thread's acquire load (wait loop) will see
+         * all prior writes to recv / bad_order before it reads stop_seen=1. */
+        __atomic_store_n(&c->stop_seen, 1, __ATOMIC_RELEASE);
         return;
     }
     if (seq != c->expected_seq) {
@@ -179,15 +181,17 @@ static void run_client_t7a(int rd, int wr)
     pipe_wr(wr, &ch, 1);
 
     double t0 = now_ms();
-    while (!cw.ox.stop_seen && !cw.ox.bad_order && (now_ms() - t0) < 120000.0)
+    while (!__atomic_load_n(&cw.ox.stop_seen, __ATOMIC_ACQUIRE)
+           && !cw.ox.bad_order && (now_ms() - t0) < 120000.0)
         usleep(2000);
 
     disp_pipe_t res;
     res.recv      = cw.ox.recv;
     res.expected  = T7_MSGS;
     res.bad_order = cw.ox.bad_order;
-    res.stop_seen = cw.ox.stop_seen;
-    res.pass      = (cw.ox.recv == T7_MSGS && !cw.ox.bad_order && cw.ox.stop_seen);
+    res.stop_seen = __atomic_load_n(&cw.ox.stop_seen, __ATOMIC_ACQUIRE);
+    res.pass      = (cw.ox.recv == T7_MSGS && !cw.ox.bad_order
+                     && __atomic_load_n(&cw.ox.stop_seen, __ATOMIC_ACQUIRE));
     pipe_wr(wr, &res, sizeof(res));
 
     shmipc_client_disconnect(cli);
@@ -222,12 +226,14 @@ static void run_server_t7b(int wr, int rd)
     child_sync = 1;
 
     double tw = now_ms();
-    while (!sw.ox.stop_seen && !sw.ox.bad_order && (now_ms() - tw) < 120000.0)
+    while (!__atomic_load_n(&sw.ox.stop_seen, __ATOMIC_ACQUIRE)
+           && !sw.ox.bad_order && (now_ms() - tw) < 120000.0)
         usleep(2000);
 
-    int ok = (sw.ox.recv == T7_MSGS && !sw.ox.bad_order && sw.ox.stop_seen);
+    int ok = (sw.ox.recv == T7_MSGS && !sw.ox.bad_order
+              && __atomic_load_n(&sw.ox.stop_seen, __ATOMIC_ACQUIRE));
     if (!ok) g_failed++;
-    tprintf("  [B] C→S  server async dispatch  recv=%u/%u  order=%s  stop=%s  %s\n",
+    tprintf("  [B] C\u2192S  server async dispatch  recv=%u/%u  order=%s  stop=%s  %s\n",
             sw.ox.recv, T7_MSGS, sw.ox.bad_order ? "BAD" : "ok",
             sw.ox.stop_seen ? "ok" : "no", ok ? "PASS" : "FAIL");
 
@@ -284,7 +290,7 @@ static void handle_rx_conc(conc_ctx_t *c, const void *d, uint32_t l)
     if (l < HDR_SZ) return;
     uint32_t seq;
     memcpy(&seq, d, 4);
-    if (seq == STOP_SEQ) { c->stop_seen = 1; return; }
+    if (seq == STOP_SEQ) { __atomic_store_n(&c->stop_seen, 1, __ATOMIC_RELEASE); return; }
     __sync_fetch_and_add(&c->recv, 1);
     usleep(T7_SLOW_US);
 }
@@ -364,14 +370,16 @@ static void run_client_t7c(int rd, int wr)
     ch = 'A'; pipe_wr(wr, &ch, 1);
 
     double t0 = now_ms();
-    while (!cw.cx.stop_seen && (now_ms() - t0) < 120000.0) usleep(2000);
+    while (!__atomic_load_n(&cw.cx.stop_seen, __ATOMIC_ACQUIRE)
+           && (now_ms() - t0) < 120000.0) usleep(2000);
 
     disp_pipe_t res;
     res.recv      = cw.cx.recv;
     res.expected  = T7_MSGS;
     res.bad_order = 0;
-    res.stop_seen = cw.cx.stop_seen;
-    res.pass      = (cw.cx.recv == T7_MSGS && cw.cx.stop_seen);
+    res.stop_seen = __atomic_load_n(&cw.cx.stop_seen, __ATOMIC_ACQUIRE);
+    res.pass      = (cw.cx.recv == T7_MSGS
+                     && __atomic_load_n(&cw.cx.stop_seen, __ATOMIC_ACQUIRE));
     pipe_wr(wr, &res, sizeof(res));
 
     shmipc_client_disconnect(cli);
@@ -403,9 +411,11 @@ static void run_server_t7d(int wr, int rd)
     child_sync = 1;
 
     double tw = now_ms();
-    while (!sw.cx.stop_seen && (now_ms() - tw) < 120000.0) usleep(2000);
+    while (!__atomic_load_n(&sw.cx.stop_seen, __ATOMIC_ACQUIRE)
+           && (now_ms() - tw) < 120000.0) usleep(2000);
 
-    int ok = (sw.cx.recv == T7_MSGS && sw.cx.stop_seen);
+    int ok = (sw.cx.recv == T7_MSGS
+              && __atomic_load_n(&sw.cx.stop_seen, __ATOMIC_ACQUIRE));
     if (!ok) g_failed++;
     tprintf("  [D] C→S  server concurrent(%u)  recv=%u/%u  stop=%s  %s\n",
             T7_CONC_THREADS, sw.cx.recv, T7_MSGS,

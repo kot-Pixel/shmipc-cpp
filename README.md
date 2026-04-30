@@ -408,15 +408,30 @@ int main(void) {
 
 ### Zero-copy receive (`on_data_zc`)
 
+**Server side** — first argument is `shmipc_session_t*`:
+
 ```c
 static void on_data_zc(shmipc_session_t* s, shmipc_buf_t* buf, void* ctx) {
     const void* data = shmipc_buf_data(buf);
     uint32_t    len  = shmipc_buf_len(buf);
     // process data ...
-    shmipc_buf_release(buf);   // MUST be called
+    shmipc_buf_release(buf);   // MUST be called exactly once
 }
 
 shmipc_server_register_on_data_zc(srv, on_data_zc);
+```
+
+**Client side** — first argument is `shmipc_client_t*` (different from server!):
+
+```c
+static void on_cli_data_zc(shmipc_client_t* cli, shmipc_buf_t* buf, void* ctx) {
+    const void* data = shmipc_buf_data(buf);
+    uint32_t    len  = shmipc_buf_len(buf);
+    // process data ...
+    shmipc_buf_release(buf);   // MUST be called exactly once
+}
+
+shmipc_client_register_on_data_zc(cli, on_cli_data_zc);
 ```
 
 ### Write-side zero-copy (`alloc_buf` / `send_buf`)
@@ -469,21 +484,50 @@ shmipc_client_set_dispatch(cli, 128, 4);       // 128-slot queue, 4 dispatch thr
 shmipc_client_connect(cli, "my_channel");
 ```
 
+### Query status
+
+```c
+// Client-side snapshot
+shmipc_client_status_t cst;
+shmipc_client_get_status(cli, &cst);
+printf("connected=%d  sent=%llu msgs  buf=%u%%\n",
+       cst.is_connected,
+       (unsigned long long)cst.msgs_sent,
+       cst.send_buffer_used_pct);
+
+// Server-side per-session snapshot (from inside on_connected / on_data callback)
+shmipc_session_status_t sst;
+shmipc_session_get_status(session, &sst);
+printf("alive=%d  recv=%llu msgs  buf=%u%%\n",
+       sst.is_alive,
+       (unsigned long long)sst.msgs_received,
+       sst.send_buffer_used_pct);
+```
+
 ---
 
 ## Running Tests
 
 ```bash
 cd shmipc/build
-./shmipc_test1_s2c    2>/dev/null   # Server→Client throughput
-./shmipc_test2_c2s    2>/dev/null   # Client→Server throughput
+./shmipc_test1_s2c    2>/dev/null   # Server→Client throughput  (3 presets × 13 payloads × 3 modes)
+./shmipc_test2_c2s    2>/dev/null   # Client→Server throughput  (single- and multi-threaded)
 ./shmipc_test3_duplex 2>/dev/null   # Full-duplex + multi-thread + mixed modes
 ./shmipc_test4_zc     2>/dev/null   # Zero-copy recv + write alloc_buf (C→S / S→C)
-./shmipc_test5_latency              # Latency monitoring API
+./shmipc_test5_latency              # Latency monitoring API (reset, histogram)
 ./shmipc_test7_dispatch             # Dispatch: serial + concurrent (S→C and C→S)
+./shmipc_bench_test   2>/dev/null   # Bidirectional benchmark (3 presets × 13 payloads)
+# Note: test6 is intentionally absent (that number was never assigned).
 ```
 
-Exit code `0` = all PASS, `1` = failure. See [`shmipc/tests/README.md`](shmipc/tests/README.md) for detailed descriptions.
+All tests exit `0` on success, `1` on failure. Or run the full suite via CTest:
+
+```bash
+cd shmipc/build
+ctest --output-on-failure
+```
+
+See [`shmipc/tests/README.md`](shmipc/tests/README.md) for detailed descriptions.
 
 **Android:** cross-compile the same test executables with the NDK (subsection **Android arm64-v8a: test binaries** under **Building**), then `adb push` and run via `adb shell` as shown there.
 
@@ -521,11 +565,11 @@ target_link_libraries(my_native_lib PRIVATE shmipc)
 ## Notes
 
 - **Concurrent writes are safe**, but NONBLOCKING writers on the same session may drop messages under contention. Use per-thread sessions for the best throughput.
-- `**on_data` / `on_data_zc` run on the consumer thread by default.** For slow processing, enable `set_dispatch` (serial or concurrent) or copy data and process asynchronously.
-- `**on_connected` must fire before writing** — do not write inside `shmipc_server_start` / `shmipc_client_connect`; wait for the callback.
-- `**on_data_zc` takes priority** over `on_data` when both are registered.
-- `**shmipc_buf_release` must be called exactly once** for every `shmipc_buf_t`* received via `on_data_zc`.
-- `**alloc_buf` / `send_buf` always consume the handle** — never use the pointer after calling either function.
+- **`on_data` / `on_data_zc` run on the consumer thread by default.** For slow processing, enable `set_dispatch` (serial or concurrent) or copy data and process asynchronously.
+- **`on_connected` must fire before writing** — do not write inside `shmipc_server_start` / `shmipc_client_connect`; wait for the callback.
+- **`on_data_zc` takes priority** over `on_data` when both are registered.
+- **`shmipc_buf_release` must be called exactly once** for every `shmipc_buf_t*` received via `on_data_zc`.
+- **`alloc_buf` / `send_buf` always consume the handle** — never use the pointer after calling either function.
 - **Multi-slice `send_buf`:** when `alloc_buf` used more than one slice, **`send_buf(..., len)` must use the same `len` as in `alloc_buf`**.
 - `channel_name` is a Unix Domain Socket abstract namespace path. Keep it ≤ 32 characters (letters, digits, underscores).
 

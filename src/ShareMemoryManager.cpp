@@ -1,6 +1,8 @@
 #include "shmipc/ShareMemoryManager.h"
 
-bool ShareMemoryManager::createShareMemory(int size) {
+bool ShareMemoryManager::createShareMemory(size_t size) {
+    if (size == 0) { LOGE("createShareMemory: size must be > 0"); return false; }
+
     shareMemoryFd = syscall(SYS_memfd_create, SHARE_MEMORY_NAME, MFD_CLOEXEC);
     if (shareMemoryFd < 0) {
         LOGI("memfd_create failed");
@@ -8,7 +10,7 @@ bool ShareMemoryManager::createShareMemory(int size) {
         return false;
     }
 
-    if (ftruncate(shareMemoryFd, size) < 0) {
+    if (ftruncate(shareMemoryFd, (off_t)size) < 0) {
         LOGI("ftruncate failed");
         close(shareMemoryFd);
         shareMemoryFd = -1;
@@ -23,6 +25,7 @@ bool ShareMemoryManager::createShareMemory(int size) {
         return false;
     }
 
+    shareMemorySize = size;   /* record for destructor / cleanupSharedMemory */
     memset(shareMemoryAddr, 0, size);
     return true;
 }

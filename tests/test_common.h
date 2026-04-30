@@ -132,6 +132,9 @@ static void pipe_rd(int fd, void *p, size_t n) {
 /* ── Spin-wait for a flag with a second-based timeout ─────────────────── */
 static void wait_flag(volatile int *flag, int timeout_s) {
     int steps = timeout_s * 10000; /* 100 µs per step */
-    for (int i = 0; !*flag && i < steps; i++)
+    /* Use an acquire load so that writes performed by the signalling thread
+     * before setting *flag are visible on ARM64 and other weakly-ordered
+     * architectures.  volatile alone does not provide an SMP memory barrier. */
+    for (int i = 0; !__atomic_load_n(flag, __ATOMIC_ACQUIRE) && i < steps; i++)
         usleep(100);
 }

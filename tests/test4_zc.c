@@ -26,6 +26,8 @@
 static FILE *out_fp = NULL;
 #define tprintf(...) fprintf(out_fp, __VA_ARGS__)
 
+static int g_integ_failed = 0;   /* tracks Section 1 & 2 failures */
+
 /* ── Config ────────────────────────────────────────────────────────── */
 #define ZC_SHM    (8u << 20)
 #define ZC_CAP    32u
@@ -318,6 +320,8 @@ static void run_server_integ_s2c(int s2c_wr, int c2s_rd)
 
         zc_result_t res;
         pipe_rd(c2s_rd, &res, sizeof(res));
+        /* track for exit-code reporting */
+        if (res.errs > 0 || res.recv != (uint32_t)ZC_MSGS) g_integ_failed++;
         print_integ_row(plen, res.recv, res.errs, ZC_MSGS);
     }
 
@@ -417,6 +421,7 @@ static void run_server_integ_c2s(int s2c_wr, int c2s_rd)
         int ticks = 0;
         while (!ctx.stop_seen && ticks < 200000) { usleep(100); ticks++; }
 
+        if (ctx.res.errs > 0 || ctx.res.recv != (uint32_t)ZC_MSGS) g_integ_failed++;
         print_integ_row(plen, ctx.res.recv, ctx.res.errs, ZC_MSGS);
 
         ch = 'N'; pipe_wr(s2c_wr, &ch, 1);  /* next */
@@ -1005,6 +1010,6 @@ int main(void)
     print_tput_footer();
 
     close(devnull);
-    tprintf("\ndone.\n");
-    return wbuf_fail ? 1 : 0;
+    tprintf("\n%s\n", (wbuf_fail || g_integ_failed) ? "overall: FAIL" : "overall: PASS");
+    return (wbuf_fail || g_integ_failed) ? 1 : 0;
 }

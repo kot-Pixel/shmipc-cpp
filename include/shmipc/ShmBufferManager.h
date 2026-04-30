@@ -91,8 +91,12 @@ struct ShmBufferEventQueue {
  *  Slice  — header only; data bytes follow immediately in memory
  * --------------------------------------------------------------- */
 struct ShmBufferSlice {
-    uint32_t next;    /* index of next slice in chain, or INVALID_INDEX */
-    uint32_t length;  /* number of valid bytes in this slice's data area */
+    /* next is atomic so that concurrent alloc_slice / free_slice calls on
+     * different slices cannot produce a data race.  sizeof(atomic<uint32_t>)
+     * equals sizeof(uint32_t) on all lock-free platforms, so SLICE_HEADER_SZ
+     * (= 8) remains correct. */
+    std::atomic<uint32_t> next;    /* index of next slice in chain, or INVALID_INDEX */
+    uint32_t              length;  /* number of valid bytes in this slice's data area */
     /* uint8_t data[slice_size]  -- accessed via get_slice_data() */
 };
 
@@ -208,7 +212,7 @@ inline void shmipc_buf_free(shmipc_buf_t* buf) {
     if (buf->borrowed) {
         uint32_t idx = buf->slice_head;
         while (idx != INVALID_INDEX) {
-            uint32_t next = get_slice(buf->list, idx)->next;
+            uint32_t next = get_slice(buf->list, idx)->next.load(std::memory_order_relaxed);
             free_slice(buf->list, idx);
             idx = next;
         }
@@ -222,15 +226,33 @@ inline void shmipc_buf_free(shmipc_buf_t* buf) {
  * If want_borrow==true AND the message fits in one slice, the returned
  * buf borrows the SHM slice directly (zero-copy receive).
  * Otherwise, data is copied to heap and the slices are freed immediately. */
+/* Returns nullptr when total_len is invalid; the caller must check.
+ * shmipc_buf_free(nullptr) is a safe no-op. */
 inline shmipc_buf_t* shmipc_buf_decode(ShmBufferList* list,
                                         uint32_t slice_idx,
                                         uint32_t total_len,
                                         bool want_borrow) {
+    /* Guard: total_len is written by the remote peer into shared memory and
+     * is therefore untrusted.  A corrupt or malicious sender could set it to
+     * ~4 GB, triggering an OOM allocation below.  Bound it against the
+     * maximum bytes the slice pool can hold; on failure free the chain and
+     * return nullptr so the caller can skip the event cleanly. */
+    const uint32_t pool_bytes = list->slice_count * list->slice_size;
+    if (total_len == 0 || total_len > pool_bytes) {
+        uint32_t idx = slice_idx;
+        while (idx != INVALID_INDEX) {
+            uint32_t next = get_slice(list, idx)->next.load(std::memory_order_relaxed);
+            free_slice(list, idx);
+            idx = next;
+        }
+        return nullptr;
+    }
+
     auto* buf = new shmipc_buf_t;
     buf->len  = total_len;
 
     ShmBufferSlice* first = get_slice(list, slice_idx);
-    if (want_borrow && first->next == INVALID_INDEX) {
+    if (want_borrow && first->next.load(std::memory_order_acquire) == INVALID_INDEX) {
         /* Single-slice: lend the SHM pointer directly. */
         buf->data       = get_slice_data(first);
         buf->borrowed   = true;
@@ -244,11 +266,12 @@ inline shmipc_buf_t* shmipc_buf_decode(ShmBufferList* list,
             ShmBufferSlice* s    = get_slice(list, idx);
             uint32_t        copy = std::min(rem, s->length);
             memcpy(owned + off, get_slice_data(s), copy);
-            rem -= copy; off += copy; idx = s->next;
+            rem -= copy; off += copy;
+            idx = s->next.load(std::memory_order_relaxed);
         }
         idx = slice_idx;
         while (idx != INVALID_INDEX) {
-            uint32_t next = get_slice(list, idx)->next;
+            uint32_t next = get_slice(list, idx)->next.load(std::memory_order_relaxed);
             free_slice(list, idx); idx = next;
         }
         buf->data       = owned;

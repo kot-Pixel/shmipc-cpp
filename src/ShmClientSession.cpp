@@ -63,6 +63,9 @@ int ShmClientSession::connect(const char* name) {
                                         [this] { return mHandshakeComplete; });
         if (!ok) {
             LOGE("handshake timeout");
+            /* BUG-1 fix: unblock readerThread (blocked in recvmsg) before
+             * joining it; without this shutdown(), stopThreads() deadlocks. */
+            if (mServerFd >= 0) shutdown(mServerFd, SHUT_RDWR);
             stopThreads();
             close(mServerFd);
             mServerFd = -1;
@@ -94,6 +97,15 @@ void ShmClientSession::disconnect() {
 }
 
 void ShmClientSession::cleanupSharedMemory() {
+    /* BUG-2/BUG-3 fix: zero the SHM buffer pointers UNDER the write mutex so
+     * that tryWriteOnce / sendWriteBuf / discardWriteBuf cannot dereference
+     * them after munmap().  Any concurrent writer that holds (or is about to
+     * acquire) mWriteMutex will see nullptr and bail out safely. */
+    {
+        std::lock_guard<std::mutex> g(mWriteMutex);
+        mServerWriteBuf = nullptr;
+        mClientWriteBuf = nullptr;
+    }
     if (mShareMemManager.shareMemoryAddr != MAP_FAILED &&
         mShareMemManager.shareMemoryAddr != nullptr) {
         munmap(mShareMemManager.shareMemoryAddr, mMetadata.shmSize);
@@ -103,8 +115,6 @@ void ShmClientSession::cleanupSharedMemory() {
         close(mShareMemManager.shareMemoryFd);
         mShareMemManager.shareMemoryFd = -1;
     }
-    mServerWriteBuf = nullptr;
-    mClientWriteBuf = nullptr;
 }
 
 int ShmClientSession::sendMessage(const ShmIpcMessage& msg) const {
@@ -137,6 +147,14 @@ void ShmClientSession::readerThread() {
         if (ok) {
             ShmIpcMessage msg;
             msg.header = ShmIpcMessageHeader::deserialize(header);
+            /* Guard against malformed / truncated messages: if length < header
+             * size the unsigned subtraction would underflow to ~4 GB, causing
+             * an OOM allocation. */
+            if (msg.header.length < SHM_SERVER_PROTOCOL_HEAD_SIZE) {
+                LOGE("malformed header: length=%u < %u — dropping connection",
+                     msg.header.length, SHM_SERVER_PROTOCOL_HEAD_SIZE);
+                break;
+            }
             uint32_t payloadLen = msg.header.length - SHM_SERVER_PROTOCOL_HEAD_SIZE;
             std::vector<char> payload(payloadLen);
             if (payloadLen > 0) {
@@ -255,15 +273,20 @@ void ShmClientSession::handleShareMemoryReady() {
 
     if (mAsyncDispatchDepth > 0) startDispatch();
 
-    mConsumerRunning.store(true, std::memory_order_release);
-    mServerWriteConsumerThread.reset(
-        new std::thread(&ShmClientSession::serverWriteConsumerThread, this));
-
+    /* BUG-11 fix: notify connect() BEFORE starting the consumer thread so
+     * that the user's onConnected() callback is guaranteed to fire before any
+     * onData() / onDataZc() callback.  At this point the server has not yet
+     * received ShareMemoryReady, so the ring buffer is empty and starting the
+     * consumer a moment later is safe. */
     {
         std::lock_guard<std::mutex> lock(mHandshakeMutex);
         mHandshakeComplete = true;
     }
     mHandshakeCV.notify_one();
+
+    mConsumerRunning.store(true, std::memory_order_release);
+    mServerWriteConsumerThread.reset(
+        new std::thread(&ShmClientSession::serverWriteConsumerThread, this));
 }
 
 void ShmClientSession::readFromServerWriteBuffer() {
@@ -288,26 +311,37 @@ void ShmClientSession::readFromServerWriteBuffer() {
             uint64_t latency_ns   = shm_now_ns() - event.write_ts_ns;
 
             if (slice_index != INVALID_INDEX) {
-                mRecvLatency.record(latency_ns);
-                mBytesReceived.fetch_add(total_len, std::memory_order_relaxed);
-                mMsgsReceived .fetch_add(1,         std::memory_order_relaxed);
-
+                /* shmipc_buf_decode returns nullptr when total_len is outside
+                 * the valid range [1, pool_bytes]; it already frees the slice
+                 * chain in that case.  Skip such corrupt events without
+                 * updating stats or calling back into user code. */
                 shmipc_buf_t* buf = shmipc_buf_decode(
                     list, slice_index, total_len, /*want_borrow=*/hasZc);
 
-                if (hasDispatch) {
-                    while (!mDispatchQueue->try_push(buf)) {
-                        if (!mConsumerRunning.load(std::memory_order_acquire)) {
-                            shmipc_buf_free(buf);
-                            goto done;
+                if (buf) {
+                    mRecvLatency.record(latency_ns);
+                    mBytesReceived.fetch_add(total_len, std::memory_order_relaxed);
+                    mMsgsReceived .fetch_add(1,         std::memory_order_relaxed);
+
+                    if (hasDispatch) {
+                        while (!mDispatchQueue->try_push(buf)) {
+                            if (!mConsumerRunning.load(std::memory_order_acquire)) {
+                                shmipc_buf_free(buf);
+                                /* Advance head before exiting: the slice has
+                                 * been freed but the queue slot must also be
+                                 * consumed so the ring remains consistent. */
+                                head = (head + 1) % cap;
+                                queue->head.store(head, std::memory_order_release);
+                                goto done;
+                            }
+                            std::this_thread::sleep_for(std::chrono::microseconds(100));
                         }
-                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    } else if (hasZc) {
+                        mOnDataZc(buf);
+                    } else {
+                        mOnData(buf->data, buf->len);
+                        shmipc_buf_free(buf);
                     }
-                } else if (hasZc) {
-                    mOnDataZc(buf);
-                } else {
-                    mOnData(buf->data, buf->len);
-                    shmipc_buf_free(buf);
                 }
             }
 
@@ -335,7 +369,7 @@ bool ShmClientSession::tryWriteOnce(const uint8_t* data, uint32_t len) {
         if (idx == INVALID_INDEX) {
             uint32_t cur = first;
             while (cur != INVALID_INDEX) {
-                uint32_t n = get_slice(list, cur)->next;
+                uint32_t n = get_slice(list, cur)->next.load(std::memory_order_relaxed);
                 free_slice(list, cur);
                 cur = n;
             }
@@ -347,9 +381,12 @@ bool ShmClientSession::tryWriteOnce(const uint8_t* data, uint32_t len) {
         memcpy(dest, data + offset, copy);
         s->length = copy;
         offset   += copy;
-        if (prev != INVALID_INDEX) get_slice(list, prev)->next = idx; else first = idx;
+        if (prev != INVALID_INDEX)
+            get_slice(list, prev)->next.store(idx, std::memory_order_relaxed);
+        else
+            first = idx;
         prev    = idx;
-        s->next = INVALID_INDEX;
+        s->next.store(INVALID_INDEX, std::memory_order_relaxed);
     }
 
     if (first == INVALID_INDEX) return false;
@@ -362,7 +399,7 @@ bool ShmClientSession::tryWriteOnce(const uint8_t* data, uint32_t len) {
     if (next_tail == head) {
         uint32_t cur = first;
         while (cur != INVALID_INDEX) {
-            uint32_t n = get_slice(list, cur)->next;
+            uint32_t n = get_slice(list, cur)->next.load(std::memory_order_relaxed);
             free_slice(list, cur);
             cur = n;
         }
@@ -381,7 +418,9 @@ bool ShmClientSession::tryWriteOnce(const uint8_t* data, uint32_t len) {
 }
 
 int ShmClientSession::writData(const uint8_t* data, uint32_t len, int32_t timeout_ms) {
-    if (!mClientWriteBuf || !data || len == 0 || !mConnected) return SHMIPC_ERR;
+    /* Basic argument validation only — mClientWriteBuf is checked INSIDE the
+     * write mutex below to avoid racing with cleanupSharedMemory(). */
+    if (!data || len == 0) return SHMIPC_ERR;
 
     using clock = std::chrono::steady_clock;
     auto deadline = (timeout_ms > 0)
@@ -395,7 +434,8 @@ int ShmClientSession::writData(const uint8_t* data, uint32_t len, int32_t timeou
     while (mConnected.load(std::memory_order_acquire)) {
         {
             std::lock_guard<std::mutex> lock(mWriteMutex);
-            if (tryWriteOnce(data, len)) {
+                if (!mClientWriteBuf) return SHMIPC_ERR;  /* SHM cleaned up */
+                if (tryWriteOnce(data, len)) {
                 mBytesSent.fetch_add(len, std::memory_order_relaxed);
                 mMsgsSent .fetch_add(1,   std::memory_order_relaxed);
                 return SHMIPC_OK;
@@ -482,14 +522,19 @@ void ShmClientSession::dispatchLoop() {
 static void free_slice_chain(ShmBufferList* list, uint32_t head) {
     uint32_t cur = head;
     while (cur != INVALID_INDEX) {
-        uint32_t n = get_slice(list, cur)->next;
+        uint32_t n = get_slice(list, cur)->next.load(std::memory_order_relaxed);
         free_slice(list, cur);
         cur = n;
     }
 }
 
 shmipc_wbuf_t* ShmClientSession::allocWriteBuf(uint32_t len) {
-    if (!mClientWriteBuf || !mConnected || len == 0) return nullptr;
+    if (len == 0) return nullptr;
+
+    /* BUG-2/BUG-3 fix: hold mWriteMutex so cleanupSharedMemory() cannot
+     * unmap the SHM region between our null-check and our first SHM access. */
+    std::lock_guard<std::mutex> g(mWriteMutex);
+    if (!mClientWriteBuf || !mConnected) return nullptr;
 
     auto*    list       = &mClientWriteBuf->buffer_list;
     uint32_t slice_size = list->slice_size;
@@ -523,11 +568,11 @@ shmipc_wbuf_t* ShmClientSession::allocWriteBuf(uint32_t len) {
         s->length           = seg;
         offset += seg;
         if (prev != INVALID_INDEX)
-            get_slice(list, prev)->next = idx;
+            get_slice(list, prev)->next.store(idx, std::memory_order_relaxed);
         else
             first = idx;
         prev    = idx;
-        s->next = INVALID_INDEX;
+        s->next.store(INVALID_INDEX, std::memory_order_relaxed);
     }
 
     if (first == INVALID_INDEX) return nullptr;
@@ -545,27 +590,43 @@ shmipc_wbuf_t* ShmClientSession::allocWriteBuf(uint32_t len) {
 
 int ShmClientSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
     if (!buf) return SHMIPC_ERR;
-    if (!mClientWriteBuf || !mConnected || len == 0 || len > buf->capacity) {
-        discardWriteBuf(buf);
-        return SHMIPC_ERR;
-    }
-    if (buf->num_slices > 1 && len != buf->alloc_len) {
-        discardWriteBuf(buf);
-        return SHMIPC_ERR;
-    }
 
-    auto* list = &mClientWriteBuf->buffer_list;
-
-    if (buf->num_slices == 1) {
-        ShmBufferSlice* s = get_slice(list, buf->slice_idx);
-        s->length         = len;
-        s->next           = INVALID_INDEX;
-    }
-
-    bool ok;
+    /* BUG-2/BUG-3 fix: hold mWriteMutex for ALL SHM accesses.
+     * cleanupSharedMemory() zeroes mClientWriteBuf under the same mutex, so
+     * any check-then-use of the pointer is race-free here. */
+    bool ok            = false;
     bool wake_consumer = false;
     {
         std::lock_guard<std::mutex> g(mWriteMutex);
+
+        /* Guard: SHM must still be mapped and buf must belong to THIS session. */
+        if (!mClientWriteBuf || !mConnected || len == 0 || len > buf->capacity
+                || buf->manager != mClientWriteBuf) {
+            /* Return slices only if the SHM region is still valid. */
+            if (buf->manager && buf->manager == mClientWriteBuf) {
+                auto* list = &mClientWriteBuf->buffer_list;
+                if (buf->num_slices > 1)
+                    free_slice_chain(list, buf->slice_idx);
+                else
+                    free_slice(list, buf->slice_idx);
+            }
+            delete buf;
+            return SHMIPC_ERR;
+        }
+        if (buf->num_slices > 1 && len != buf->alloc_len) {
+            auto* list = &mClientWriteBuf->buffer_list;
+            free_slice_chain(list, buf->slice_idx);
+            delete buf;
+            return SHMIPC_ERR;
+        }
+
+        auto* list = &mClientWriteBuf->buffer_list;
+        if (buf->num_slices == 1) {
+            ShmBufferSlice* s = get_slice(list, buf->slice_idx);
+            s->length = len;
+            s->next.store(INVALID_INDEX, std::memory_order_relaxed);
+        }
+
         ok = shm_queue_commit(&mClientWriteBuf->io_queue, buf->slice_idx, len);
         if (ok) {
             /* Must match tryWriteOnce: server consumer only drains when WORKING_FLAG
@@ -573,15 +634,15 @@ int ShmClientSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
             uint32_t prev = mClientWriteBuf->io_queue.workingFlags.fetch_or(
                 WORKING_FLAG, std::memory_order_acq_rel);
             wake_consumer = (prev & WORKING_FLAG) == 0;
+        } else {
+            if (buf->num_slices > 1)
+                free_slice_chain(list, buf->slice_idx);
+            else
+                free_slice(list, buf->slice_idx);
         }
     }
 
-    if (!ok) {
-        if (buf->num_slices > 1)
-            free_slice_chain(list, buf->slice_idx);
-        else
-            free_slice(list, buf->slice_idx);
-    } else {
+    if (ok) {
         mBytesSent.fetch_add(len, std::memory_order_relaxed);
         mMsgsSent.fetch_add(1, std::memory_order_relaxed);
     }
@@ -596,12 +657,20 @@ int ShmClientSession::sendWriteBuf(shmipc_wbuf_t* buf, uint32_t len) {
 
 void ShmClientSession::discardWriteBuf(shmipc_wbuf_t* buf) {
     if (!buf) return;
-    if (buf->manager) {
-        auto* list = &buf->manager->buffer_list;
-        if (buf->num_slices > 1)
-            free_slice_chain(list, buf->slice_idx);
-        else
-            free_slice(list, buf->slice_idx);
+    {
+        /* BUG-2/BUG-3 fix: only touch SHM if the region is still mapped.
+         * cleanupSharedMemory() clears mClientWriteBuf under mWriteMutex,
+         * so the comparison is race-free here. */
+        std::lock_guard<std::mutex> g(mWriteMutex);
+        if (buf->manager && buf->manager == mClientWriteBuf) {
+            auto* list = &buf->manager->buffer_list;
+            if (buf->num_slices > 1)
+                free_slice_chain(list, buf->slice_idx);
+            else
+                free_slice(list, buf->slice_idx);
+        }
+        /* If buf->manager != mClientWriteBuf the SHM region is already gone;
+         * we cannot return slices but we must still free the handle itself. */
     }
     delete buf;
 }
@@ -614,14 +683,17 @@ void ShmClientSession::getStatus(shmipc_client_status_t* out) const {
     out->bytes_received = mBytesReceived.load(std::memory_order_relaxed);
     out->msgs_received  = mMsgsReceived .load(std::memory_order_relaxed);
 
-    /* Instantaneous ring-buffer fullness (best-effort, no lock) */
+    /* Instantaneous ring-buffer fullness (best-effort, no lock).
+     * Use modular arithmetic so the result is correct even when the tail
+     * pointer has wrapped around past head (unsigned subtraction alone
+     * would produce ~4 GB, causing the guard used <= cap to fail). */
     if (mClientWriteBuf) {
-        const auto& q = mClientWriteBuf->io_queue;
-        uint32_t used = q.tail.load(std::memory_order_relaxed)
-                      - q.head.load(std::memory_order_relaxed);
-        uint32_t cap  = q.capacity;
-        out->send_buffer_used_pct = (cap > 0 && used <= cap)
-                                    ? (used * 100u / cap) : 0u;
+        const auto& q   = mClientWriteBuf->io_queue;
+        uint32_t tail   = q.tail.load(std::memory_order_relaxed);
+        uint32_t head   = q.head.load(std::memory_order_relaxed);
+        uint32_t cap    = q.capacity;
+        uint32_t used   = (cap > 0) ? ((tail - head + cap) % cap) : 0u;
+        out->send_buffer_used_pct = (cap > 0) ? (used * 100u / cap) : 0u;
     } else {
         out->send_buffer_used_pct = 0;
     }

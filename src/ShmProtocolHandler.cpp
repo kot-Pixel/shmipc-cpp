@@ -9,8 +9,6 @@ bool ShmProtocolHandler::receiveProtocolHeader(int fd, uint8_t* header, std::vec
     char cmsgbuf[CMSG_SPACE(sizeof(int) * SHM_SERVER_MAX_UDS_PROTOCOL_FD)];
     memset(cmsgbuf, 0, sizeof(cmsgbuf));
 
-    bool control_parsed = false;
-
     while (total < SHM_SERVER_PROTOCOL_HEAD_SIZE)
     {
         struct iovec iov;
@@ -20,6 +18,8 @@ bool ShmProtocolHandler::receiveProtocolHeader(int fd, uint8_t* header, std::vec
         struct msghdr msg{};
         msg.msg_iov    = &iov;
         msg.msg_iovlen = 1;
+        /* Provide the control buffer on every call: SCM_RIGHTS may arrive on
+         * any recvmsg() iteration when the header spans multiple reads. */
         msg.msg_control    = cmsgbuf;
         msg.msg_controllen = sizeof(cmsgbuf);
 
@@ -38,24 +38,21 @@ bool ShmProtocolHandler::receiveProtocolHeader(int fd, uint8_t* header, std::vec
             return false;
         }
 
-        if (!control_parsed) {
-            struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-            while (cmsg) {
-                if (cmsg->cmsg_level == SOL_SOCKET &&
-                    cmsg->cmsg_type  == SCM_RIGHTS)
-                {
-                    int* fds = (int*)CMSG_DATA(cmsg);
-                    size_t fd_count =
-                            (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-
-                    for (size_t i = 0; i < fd_count; i++) {
-                        received_fds.push_back(fds[i]);
-                    }
-                }
-                cmsg = CMSG_NXTHDR(&msg, cmsg);
+        /* Always process ancillary data from THIS recvmsg() call. */
+        for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type  == SCM_RIGHTS) {
+                int*   fds      = (int*)CMSG_DATA(cmsg);
+                size_t fd_count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                for (size_t i = 0; i < fd_count; i++)
+                    received_fds.push_back(fds[i]);
             }
-            control_parsed = true;
         }
+        /* Zero the buffer so stale data from this call cannot bleed into
+         * the next iteration if the kernel writes no control data there. */
+        memset(cmsgbuf, 0, sizeof(cmsgbuf));
+
         total += n;
     }
     return true;
@@ -131,14 +128,22 @@ int ShmProtocolHandler::sendShmMessage(int socketFd, const ShmIpcMessage& messag
     bool control_sent = false;
 
     while (total < expected) {
-        ssize_t n = sendmsg(socketFd, &msg, 0);
+        /* MSG_NOSIGNAL: convert SIGPIPE (which would kill the process) to an
+         * EPIPE errno that we can handle gracefully. */
+        ssize_t n = sendmsg(socketFd, &msg, MSG_NOSIGNAL);
 
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Back-pressure: sleep 100 µs to avoid a hot busy-loop. */
+                usleep(100);
                 continue;
-
+            }
+            if (errno == EPIPE || errno == ECONNRESET) {
+                LOGI("connection closed during send (errno=%d)", errno);
+                return -1;
+            }
             LOGE("send msg failed errno=%d (%s)", errno, strerror(errno));
             return -1;
         }

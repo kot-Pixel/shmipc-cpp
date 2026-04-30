@@ -92,11 +92,15 @@ static double now_ms(void) {
     return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
 }
 
+/* Rotating 4-buffer: safe for up to 4 calls per printf() format string. */
 static const char *fmtsz(uint32_t n) {
-    static char b[16];
-    if      (n >= 1u<<20) snprintf(b, sizeof b, "%4uMB", n>>20);
-    else if (n >= 1u<<10) snprintf(b, sizeof b, "%4uKB", n>>10);
-    else                  snprintf(b, sizeof b, "%4u B", n);
+    static char bufs[4][16];
+    static int  idx = 0;
+    idx = (idx + 1) & 3;
+    char *b = bufs[idx];
+    if      (n >= 1u<<20) snprintf(b, 16, "%4uMB", n>>20);
+    else if (n >= 1u<<10) snprintf(b, 16, "%4uKB", n>>10);
+    else                  snprintf(b, 16, "%4u B", n);
     return b;
 }
 

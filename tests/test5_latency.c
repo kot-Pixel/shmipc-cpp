@@ -21,6 +21,8 @@
 static FILE *out_fp = NULL;
 #define tprintf(...) fprintf(out_fp, __VA_ARGS__)
 
+static int g_failed = 0;   /* incremented on any sub-test FAIL */
+
 /* ── Channel config ────────────────────────────────────────────── */
 #define LAT_SHM   (16u << 20)
 #define LAT_CAP   64u
@@ -107,6 +109,7 @@ static void print_lat(const char *label,
                     s->p999_ns<= s->max_ns);
     int nonzero  = (s->count > 0 && s->max_ns > 0);
     const char *v = (count_ok && order_ok && nonzero) ? "PASS" : "FAIL";
+    if (!(count_ok && order_ok && nonzero)) g_failed++;
 
     char mn[32], avg[32], p50[32], p90[32], p99[32], p999[32], mx[32];
     ns_str(s->min_ns,  mn,   sizeof(mn));
@@ -362,6 +365,7 @@ static void run_client_c(int rd, int wr)
     int before_ok = (res.before == (uint64_t)(C_MSGS_1 + 1));
     int after_ok  = (res.after  == (uint64_t)(C_MSGS_2 + 1));
     const char *v = (before_ok && after_ok) ? "PASS" : "FAIL";
+    if (!before_ok || !after_ok) g_failed++;
 
     tprintf("\n  [C] session_reset_latency clears histogram\n");
     tprintf("      before_reset count=%llu (expect %d)  %s\n",
@@ -415,8 +419,8 @@ int main(void)
 
 #undef FORK_TEST
 
-    tprintf("\ndone.\n");
+    tprintf("\n%s\n", g_failed ? "overall: FAIL" : "overall: PASS");
     fclose(out_fp);
     close(devnull);
-    return 0;
+    return g_failed ? 1 : 0;
 }

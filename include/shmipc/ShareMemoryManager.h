@@ -14,13 +14,26 @@
 
 class ShareMemoryManager {
 public:
-    int   shareMemoryFd   = -1;
-    void* shareMemoryAddr = MAP_FAILED;
+    int    shareMemoryFd   = -1;
+    void*  shareMemoryAddr = MAP_FAILED;
+    size_t shareMemorySize = 0;   /* set by createShareMemory(); used by destructor */
 
-    bool createShareMemory(int size);
+    bool createShareMemory(size_t size);
 
     ShareMemoryManager() = default;
-    ~ShareMemoryManager() = default;
+
+    /* Destructor releases any resources not already freed by the session's
+     * cleanupSharedMemory().  The sentinel checks prevent double-release. */
+    ~ShareMemoryManager() {
+        if (shareMemoryAddr != MAP_FAILED && shareMemoryAddr != nullptr) {
+            munmap(shareMemoryAddr, shareMemorySize);
+            shareMemoryAddr = MAP_FAILED;
+        }
+        if (shareMemoryFd >= 0) {
+            close(shareMemoryFd);
+            shareMemoryFd = -1;
+        }
+    }
 };
 
 #endif //SHMIPC_SHAREMEMORYMANAGER_H

@@ -87,18 +87,27 @@ void shmipc_buf_release(shmipc_buf_t* buf) {
 extern "C" {
 
 shmipc_server_t* shmipc_server_create(void) {
-    return new shmipc_server;
+    auto* s = new shmipc_server;
+    /* BUG-7 fix: always install an internal onDisconnected handler so that
+     * apiHandle objects are freed even if the user never calls
+     * shmipc_server_register_on_disconnected().  The user's callback (stored
+     * in s->on_disconnected_cb) is invoked before the handle is deleted. */
+    s->impl.setOnDisconnected([s](ShmServerSession* ss) {
+        auto* h = static_cast<shmipc_session*>(ss->apiHandle);
+        if (h) {
+            if (s->on_disconnected_cb) s->on_disconnected_cb(h, s->ctx);
+            delete h;
+            ss->apiHandle = nullptr;
+        }
+    });
+    return s;
 }
 
 void shmipc_server_destroy(shmipc_server_t* s) {
     if (!s) return;
+    /* stop() triggers onDisconnected for every active session, which frees
+     * the apiHandle via the handler installed in shmipc_server_create(). */
     s->impl.stop();
-    for (auto* ss : s->impl.getAllSessions()) {
-        if (ss->apiHandle) {
-            delete static_cast<shmipc_session*>(ss->apiHandle);
-            ss->apiHandle = nullptr;
-        }
-    }
     delete s;
 }
 
@@ -133,15 +142,9 @@ void shmipc_server_register_on_data_zc(shmipc_server_t* s, shmipc_on_data_zc_cb 
 
 void shmipc_server_register_on_disconnected(shmipc_server_t* s, shmipc_on_disconnect_cb cb) {
     if (!s) return;
+    /* Just store the callback — the cleanup handler was already installed in
+     * shmipc_server_create() and will call this cb before freeing the handle. */
     s->on_disconnected_cb = cb;
-    s->impl.setOnDisconnected([s](ShmServerSession* ss) {
-        if (s->on_disconnected_cb) {
-            auto* h = get_or_create_server_session_handle(ss);
-            s->on_disconnected_cb(h, s->ctx);
-            delete h;
-            ss->apiHandle = nullptr;
-        }
-    });
 }
 
 int shmipc_server_start(shmipc_server_t* s, const char* channel_name) {
@@ -303,7 +306,7 @@ void* shmipc_wbuf_slice_data(shmipc_wbuf_t* buf, uint32_t slice_index) {
     auto* list = &buf->manager->buffer_list;
     uint32_t cur = buf->slice_idx;
     for (uint32_t k = 0; k < slice_index && cur != INVALID_INDEX; ++k)
-        cur = get_slice(list, cur)->next;
+        cur = get_slice(list, cur)->next.load(std::memory_order_relaxed);
     if (cur == INVALID_INDEX) return nullptr;
     return get_slice_data(get_slice(list, cur));
 }
@@ -322,12 +325,12 @@ shmipc_wbuf_t* shmipc_session_alloc_buf(shmipc_session_t* s, uint32_t len) {
 }
 int shmipc_session_send_buf(shmipc_session_t* s, shmipc_wbuf_t* buf, uint32_t len) {
     if (!s || s->type != shmipc_session::SERVER_SIDE) {
-        if (s && buf) {
-            if (s->type == shmipc_session::SERVER_SIDE)
-                s->server_session->discardWriteBuf(buf);
-            else if (s->type == shmipc_session::CLIENT_SIDE)
-                s->client_session->discardWriteBuf(buf);
-        }
+        /* BUG-9 fix: the inner SERVER_SIDE branch was dead code (always false).
+         * If buf was allocated from a client session, return it safely. */
+        if (buf && s && s->type == shmipc_session::CLIENT_SIDE)
+            s->client_session->discardWriteBuf(buf);
+        /* else: session is null — cannot determine which SHM region owns buf,
+         * so we cannot safely return slices (accessing unknown SHM is worse). */
         return SHMIPC_ERR;
     }
     return s->server_session->sendWriteBuf(buf, len);
@@ -343,7 +346,9 @@ shmipc_wbuf_t* shmipc_client_alloc_buf(shmipc_client_t* c, uint32_t len) {
 }
 int shmipc_client_send_buf(shmipc_client_t* c, shmipc_wbuf_t* buf, uint32_t len) {
     if (!c || !c->impl.session()) {
-        if (c && c->impl.session() && buf) c->impl.session()->discardWriteBuf(buf);
+        /* BUG-9 fix: the inner condition `c && c->impl.session()` was always
+         * false here (contradicts the outer guard), so buf was never freed.
+         * With a null client/session we cannot safely access SHM; just error. */
         return SHMIPC_ERR;
     }
     return c->impl.session()->sendWriteBuf(buf, len);

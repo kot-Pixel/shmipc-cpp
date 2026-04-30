@@ -95,7 +95,16 @@ if [ "$SKIP_ARM64" -eq 0 ]; then
         echo "       Set ANDROID_NDK_HOME to the correct path."
         exit 1
     fi
-    STRIP_TOOL="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+    # Detect host OS + arch so the correct prebuilt toolchain directory is used.
+    # NDK prebuilt names: linux-x86_64 | darwin-x86_64 | darwin-arm64 (mapped
+    # below because NDK ships only the x86_64 Darwin toolchain via Rosetta).
+    _HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    _HOST_ARCH="$(uname -m)"
+    case "${_HOST_OS}-${_HOST_ARCH}" in
+        darwin-arm64) _HOST_TAG="darwin-x86_64" ;;   # Apple Silicon: use Rosetta build
+        *)            _HOST_TAG="${_HOST_OS}-${_HOST_ARCH}" ;;
+    esac
+    STRIP_TOOL="$NDK/toolchains/llvm/prebuilt/${_HOST_TAG}/bin/llvm-strip"
 
     B="$SCRIPT_DIR/build_arm64"
     cmake -S "$SCRIPT_DIR" -B "$B" \

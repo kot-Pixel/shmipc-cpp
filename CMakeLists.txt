@@ -1,14 +1,15 @@
 cmake_minimum_required(VERSION 3.14)
-project(shmipc VERSION 1.0.0 LANGUAGES C CXX)
+project(shmipc VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 11)
 
-option(SHMIPC_BUILD_SHARED  "Build as shared library instead of static" OFF)
-option(SHMIPC_BUILD_EXAMPLES "Build example server/client programs"     ON)
-option(SHMIPC_ANDROID_MIN_SIZE "Enable extra Android size optimizations" ON)
+option(SHMIPC_BUILD_SHARED     "Build as shared library instead of static"  OFF)
+option(SHMIPC_BUILD_EXAMPLES   "Build example server/client programs"        ON)
+option(SHMIPC_BUILD_TESTS      "Build benchmark / integration tests"         ON)
+option(SHMIPC_ANDROID_MIN_SIZE "Enable extra Android size optimizations"     ON)
 
 set(SHMIPC_SOURCES
     src/ShmBufferManager.cpp
@@ -39,7 +40,8 @@ target_include_directories(shmipc
 )
 
 if(NOT ANDROID)
-    target_link_libraries(shmipc PUBLIC pthread)
+    # PRIVATE: pthread is an implementation detail; consumers must not inherit it.
+    target_link_libraries(shmipc PRIVATE pthread)
 endif()
 
 set_target_properties(shmipc PROPERTIES
@@ -100,7 +102,6 @@ if(SHMIPC_BUILD_EXAMPLES)
     target_link_libraries(shmipc_client PRIVATE shmipc)
 endif()
 
-option(SHMIPC_BUILD_TESTS "Build benchmark / integration tests" ON)
 # Tests link pthread on Linux desktop; Android Bionic includes pthread — no -lpthread.
 function(shmipc_add_test name src)
     add_executable(${name} tests/${src})
@@ -111,12 +112,24 @@ function(shmipc_add_test name src)
 endfunction()
 
 if(SHMIPC_BUILD_TESTS)
-    shmipc_add_test(shmipc_test1_s2c   test1_s2c.c)
-    shmipc_add_test(shmipc_test2_c2s   test2_c2s.c)
-    shmipc_add_test(shmipc_test3_duplex test3_duplex.c)
-    shmipc_add_test(shmipc_test4_zc    test4_zc.c)
-    shmipc_add_test(shmipc_test5_latency test5_latency.c)
+    enable_testing()   # required for `ctest` and add_test()
+
+    shmipc_add_test(shmipc_test1_s2c      test1_s2c.c)
+    shmipc_add_test(shmipc_test2_c2s      test2_c2s.c)
+    shmipc_add_test(shmipc_test3_duplex   test3_duplex.c)
+    shmipc_add_test(shmipc_test4_zc       test4_zc.c)
+    shmipc_add_test(shmipc_test5_latency  test5_latency.c)
     shmipc_add_test(shmipc_test7_dispatch test7_dispatch.c)
+    shmipc_add_test(shmipc_bench_test     bench_test.c)   # was previously missing
+
+    # Register with CTest so `ctest` can drive the suite automatically.
+    add_test(NAME s2c       COMMAND shmipc_test1_s2c)
+    add_test(NAME c2s       COMMAND shmipc_test2_c2s)
+    add_test(NAME duplex    COMMAND shmipc_test3_duplex)
+    add_test(NAME zc        COMMAND shmipc_test4_zc)
+    add_test(NAME latency   COMMAND shmipc_test5_latency)
+    add_test(NAME dispatch  COMMAND shmipc_test7_dispatch)
+    add_test(NAME bench     COMMAND shmipc_bench_test)
 endif()
 
 # ---------------------------------------------------------------

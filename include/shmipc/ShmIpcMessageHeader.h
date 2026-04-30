@@ -52,11 +52,13 @@ public:
     {
         ShmIpcMessageHeader h;
 
+        /* Cast each byte to uint32_t before shifting to avoid signed-integer
+         * overflow UB when the high bit of data[0] is set (value >= 0x80). */
         uint32_t be_len =
-                (data[0] << 24) |
-                (data[1] << 16) |
-                (data[2] << 8)  |
-                (data[3]);
+                ((uint32_t)data[0] << 24) |
+                ((uint32_t)data[1] << 16) |
+                ((uint32_t)data[2] << 8)  |
+                ((uint32_t)data[3]);
 
         h.length  = ntohl(be_len);
         h.version = data[4];

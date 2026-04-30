@@ -4,7 +4,9 @@
 uint32_t alloc_slice(ShmBufferList* list) {
     uint32_t head = list->free_head.load(std::memory_order_acquire);
     while (head != INVALID_INDEX) {
-        uint32_t next = get_slice(list, head)->next;
+        /* relaxed: the acquire on free_head above already establishes the
+         * happens-before with the release CAS in free_slice that wrote next. */
+        uint32_t next = get_slice(list, head)->next.load(std::memory_order_relaxed);
         if (list->free_head.compare_exchange_weak(head, next,
                                                   std::memory_order_acq_rel)) {
             return head;
@@ -16,7 +18,10 @@ uint32_t alloc_slice(ShmBufferList* list) {
 void free_slice(ShmBufferList* list, uint32_t idx) {
     uint32_t head = list->free_head.load(std::memory_order_acquire);
     do {
-        get_slice(list, idx)->next = head;
+        /* relaxed store: the acq_rel CAS below provides the release fence that
+         * makes this write visible to any thread that subsequently loads
+         * free_head with acquire and then reads next. */
+        get_slice(list, idx)->next.store(head, std::memory_order_relaxed);
     } while (!list->free_head.compare_exchange_weak(head, idx,
                                                     std::memory_order_acq_rel));
 }
@@ -58,7 +63,8 @@ ShmBufferManager* init_shm_buffer_manager(void*    addr,
 
     for (uint32_t i = 0; i < slice_count; ++i) {
         ShmBufferSlice* s = get_slice(&mgr->buffer_list, i);
-        s->next   = (i + 1 < slice_count) ? i + 1 : INVALID_INDEX;
+        s->next.store((i + 1 < slice_count) ? i + 1 : INVALID_INDEX,
+                       std::memory_order_relaxed);
         s->length = 0;
     }
 

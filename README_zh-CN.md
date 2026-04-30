@@ -395,15 +395,30 @@ int main(void) {
 
 ### 零拷贝接收（`on_data_zc`）
 
+**服务端** — 第一个参数为 `shmipc_session_t*`：
+
 ```c
 static void on_data_zc(shmipc_session_t* s, shmipc_buf_t* buf, void* ctx) {
     const void* data = shmipc_buf_data(buf);
     uint32_t    len  = shmipc_buf_len(buf);
     // 处理数据 ...
-    shmipc_buf_release(buf);   // 必须调用
+    shmipc_buf_release(buf);   // 必须恰好调用一次
 }
 
 shmipc_server_register_on_data_zc(srv, on_data_zc);
+```
+
+**客户端** — 第一个参数为 `shmipc_client_t*`（与服务端不同！）：
+
+```c
+static void on_cli_data_zc(shmipc_client_t* cli, shmipc_buf_t* buf, void* ctx) {
+    const void* data = shmipc_buf_data(buf);
+    uint32_t    len  = shmipc_buf_len(buf);
+    // 处理数据 ...
+    shmipc_buf_release(buf);   // 必须恰好调用一次
+}
+
+shmipc_client_register_on_data_zc(cli, on_cli_data_zc);
 ```
 
 ### 写端零拷贝（`alloc_buf` / `send_buf`）
@@ -471,15 +486,24 @@ printf("connected=%d  sent=%llu msgs  buf=%u%%\n",
 
 ```bash
 cd shmipc/build
-./shmipc_test1_s2c    2>/dev/null   # Server→Client 单向吞吐
-./shmipc_test2_c2s    2>/dev/null   # Client→Server 单向吞吐
+./shmipc_test1_s2c    2>/dev/null   # Server→Client 单向吞吐（3 预设 × 13 负载 × 3 模式）
+./shmipc_test2_c2s    2>/dev/null   # Client→Server 单向吞吐（单线程 + 多线程）
 ./shmipc_test3_duplex 2>/dev/null   # 全双工 + 多线程 + 混合模式
 ./shmipc_test4_zc     2>/dev/null   # 零拷贝接收 + 写端 alloc_buf（C→S / S→C）
-./shmipc_test5_latency              # 延迟监控 API 验证
+./shmipc_test5_latency              # 延迟监控 API 验证（reset、直方图）
 ./shmipc_test7_dispatch             # Dispatch：串行 + 并发（S→C 与 C→S）
+./shmipc_bench_test   2>/dev/null   # 双向基准测试（3 预设 × 13 负载）
+# 注：test6 编号未被使用，这是有意为之。
 ```
 
-退出码 `0` = 全部 PASS，`1` = 有 FAIL。详细说明见 [`shmipc/tests/README.md`](shmipc/tests/README.md)。
+所有测试退出码 `0` = PASS，`1` = FAIL。也可使用 CTest 批量运行：
+
+```bash
+cd shmipc/build
+ctest --output-on-failure
+```
+
+详细说明见 [`shmipc/tests/README.md`](shmipc/tests/README.md)。
 
 **Android 真机：** 使用 NDK 交叉编译上述测试可执行文件，并用 `adb push` / `adb shell` 运行；步骤见上文 **「Android arm64-v8a：编译测试程序」** 一节。
 
