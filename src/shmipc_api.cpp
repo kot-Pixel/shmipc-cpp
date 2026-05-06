@@ -26,6 +26,7 @@ const shmipc_config_t SHMIPC_CONFIG_HIGH_THROUGHPUT = {
 
 struct shmipc_session {
     enum { SERVER_SIDE, CLIENT_SIDE } type;
+    bool alive = true;
     union {
         ShmServerSession* server_session;
         ShmClientSession* client_session;
@@ -95,9 +96,8 @@ shmipc_server_t* shmipc_server_create(void) {
     s->impl.setOnDisconnected([s](ShmServerSession* ss) {
         auto* h = static_cast<shmipc_session*>(ss->apiHandle);
         if (h) {
+            h->alive = false;
             if (s->on_disconnected_cb) s->on_disconnected_cb(h, s->ctx);
-            delete h;
-            ss->apiHandle = nullptr;
         }
     });
     return s;
@@ -105,9 +105,17 @@ shmipc_server_t* shmipc_server_create(void) {
 
 void shmipc_server_destroy(shmipc_server_t* s) {
     if (!s) return;
-    /* stop() triggers onDisconnected for every active session, which frees
-     * the apiHandle via the handler installed in shmipc_server_create(). */
+    /* Collect apiHandles before stop() destroys sessions, null them so
+     * onDisconnected (triggered by stop) skips already-collected ones. */
+    auto sessions = s->impl.getAllSessions();
+    std::vector<void*> handles;
+    for (auto* ss : sessions) {
+        handles.push_back(ss->apiHandle);
+        ss->apiHandle = nullptr;
+    }
     s->impl.stop();
+    for (auto* h : handles)
+        delete static_cast<shmipc_session*>(h);
     delete s;
 }
 
@@ -159,6 +167,7 @@ void shmipc_server_stop(shmipc_server_t* s) {
 int shmipc_session_write(shmipc_session_t* session, const void* data, uint32_t len,
                          int32_t timeout_ms) {
     if (!session || !data || len == 0) return SHMIPC_ERR;
+    if (!session->alive) return SHMIPC_ERR;
     if (session->type == shmipc_session::SERVER_SIDE) {
         return session->server_session->writData(
                 static_cast<const uint8_t*>(data), len, timeout_ms);
@@ -270,20 +279,34 @@ void shmipc_server_get_status(shmipc_server_t* s, shmipc_server_status_t* out) {
 
 void shmipc_session_get_status(shmipc_session_t* session, shmipc_session_status_t* out) {
     if (!session || !out) return;
-    if (session->type == shmipc_session::SERVER_SIDE)
+    if (session->type == shmipc_session::SERVER_SIDE) {
         session->server_session->getStatus(out);
+    } else {
+        shmipc_client_status_t cs;
+        session->client_session->getStatus(&cs);
+        out->is_alive             = cs.is_connected;
+        out->bytes_sent           = cs.bytes_sent;
+        out->msgs_sent            = cs.msgs_sent;
+        out->bytes_received       = cs.bytes_received;
+        out->msgs_received        = cs.msgs_received;
+        out->send_buffer_used_pct = cs.send_buffer_used_pct;
+    }
 }
 
 void shmipc_session_get_latency(shmipc_session_t* session, shmipc_latency_stats_t* out) {
     if (!session || !out) return;
     if (session->type == shmipc_session::SERVER_SIDE)
         session->server_session->getLatency(out);
+    else
+        session->client_session->getLatency(out);
 }
 
 void shmipc_session_reset_latency(shmipc_session_t* session) {
     if (!session) return;
     if (session->type == shmipc_session::SERVER_SIDE)
         session->server_session->resetLatency();
+    else
+        session->client_session->resetLatency();
 }
 
 /* ================================================================

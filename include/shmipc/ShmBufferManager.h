@@ -237,8 +237,11 @@ inline shmipc_buf_t* shmipc_buf_decode(ShmBufferList* list,
      * ~4 GB, triggering an OOM allocation below.  Bound it against the
      * maximum bytes the slice pool can hold; on failure free the chain and
      * return nullptr so the caller can skip the event cleanly. */
-    const uint32_t pool_bytes = list->slice_count * list->slice_size;
-    if (total_len == 0 || total_len > pool_bytes) {
+    /* Use 64-bit multiplication to avoid overflow when both slice_count
+     * and slice_size are large (e.g. corrupted by a malicious peer). */
+    const uint64_t pool_bytes = static_cast<uint64_t>(list->slice_count)
+                              * static_cast<uint64_t>(list->slice_size);
+    if (total_len == 0 || total_len > pool_bytes || pool_bytes > UINT32_MAX) {
         uint32_t idx = slice_idx;
         while (idx != INVALID_INDEX) {
             uint32_t next = get_slice(list, idx)->next.load(std::memory_order_relaxed);
@@ -290,7 +293,12 @@ ShmBufferManager* init_shm_buffer_manager(void*    addr,
                                            uint32_t event_queue_capacity,
                                            uint32_t slice_size);
 
-/* Attach to an already-initialized region (no memset / re-init). */
-ShmBufferManager* attach_shm_buffer_manager(void* addr);
+/* Attach to an already-initialized region (no memset / re-init).
+ * region_size: byte size of this sub-region (caller must provide the
+ *   correct half of the total SHM area).  The function validates that the
+ *   embedded metadata (capacity, slice_count, slice_size, stride) is
+ *   self-consistent and fits within region_size.  Returns nullptr on
+ *   validation failure. */
+ShmBufferManager* attach_shm_buffer_manager(void* addr, size_t region_size);
 
 #endif //SHMIPC_SHMBUFFERMANAGER_H

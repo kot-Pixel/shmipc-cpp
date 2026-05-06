@@ -83,7 +83,11 @@ int ShmClientSession::connect(const char* name) {
 }
 
 void ShmClientSession::disconnect() {
-    if (!mConnected && !mReadThreadRunning) return;
+    /* Fix B: removed the early-return guard.  All operations below are
+     * idempotent (stopThreads checks joinable(), cleanupSharedMemory
+     * checks pointers, close() guards on >=0).  The old guard could skip
+     * cleanup during a narrow window between reader-thread exit and
+     * mMessageQueue.stop(), leaving the processor thread orphaned. */
 
     mConnected         = false;
     mReadThreadRunning = false;
@@ -260,9 +264,16 @@ void ShmClientSession::handleShareMemoryReady() {
     if (mShareMemManager.shareMemoryAddr == MAP_FAILED) return;
 
     size_t half     = mMetadata.shmSize / 2;
-    mServerWriteBuf = attach_shm_buffer_manager(mShareMemManager.shareMemoryAddr);
+    /* Attach with region-size validation (Fix #1). */
+    mServerWriteBuf = attach_shm_buffer_manager(mShareMemManager.shareMemoryAddr, half);
     mClientWriteBuf = attach_shm_buffer_manager(
-            (char*)mShareMemManager.shareMemoryAddr + half);
+            (char*)mShareMemManager.shareMemoryAddr + half,
+            mMetadata.shmSize - half);
+
+    if (!mServerWriteBuf || !mClientWriteBuf) {
+        LOGE("attach_shm_buffer_manager validation failed");
+        return;
+    }
 
     LOGD("server_write: cap=%u slices=%u slice_size=%u  "
          "client_write: cap=%u slices=%u slice_size=%u",
@@ -324,12 +335,15 @@ void ShmClientSession::readFromServerWriteBuffer() {
                     mMsgsReceived .fetch_add(1,         std::memory_order_relaxed);
 
                     if (hasDispatch) {
+                        /* Async dispatch: bounded retry (100 µs × 1000 = 100 ms max).
+                         * Fix #7: if the dispatch queue stays full beyond the retry
+                         * limit, drop the message and free the slice so the ring
+                         * buffer can keep draining. */
+                        int retries = 1000;
                         while (!mDispatchQueue->try_push(buf)) {
-                            if (!mConsumerRunning.load(std::memory_order_acquire)) {
+                            if (!mConsumerRunning.load(std::memory_order_acquire)
+                                || --retries <= 0) {
                                 shmipc_buf_free(buf);
-                                /* Advance head before exiting: the slice has
-                                 * been freed but the queue slot must also be
-                                 * consumed so the ring remains consistent. */
                                 head = (head + 1) % cap;
                                 queue->head.store(head, std::memory_order_release);
                                 goto done;
@@ -361,6 +375,12 @@ bool ShmClientSession::tryWriteOnce(const uint8_t* data, uint32_t len) {
     auto*    list          = &mClientWriteBuf->buffer_list;
     auto*    queue         = &mClientWriteBuf->io_queue;
     uint32_t slice_size    = list->slice_size;
+
+    /* Fix #2: bound len against total pool capacity to prevent integer
+     * overflow in slices_needed = (len + slice_size - 1) / slice_size. */
+    if (len > static_cast<uint64_t>(list->slice_count) * list->slice_size)
+        return false;
+
     uint32_t slices_needed = (len + slice_size - 1) / slice_size;
     uint32_t first = INVALID_INDEX, prev = INVALID_INDEX, offset = 0;
 
@@ -435,6 +455,13 @@ int ShmClientSession::writData(const uint8_t* data, uint32_t len, int32_t timeou
         {
             std::lock_guard<std::mutex> lock(mWriteMutex);
                 if (!mClientWriteBuf) return SHMIPC_ERR;  /* SHM cleaned up */
+                /* Permanent failure: message larger than total pool capacity.
+                 * tryWriteOnce would always fail, so reject immediately
+                 * regardless of timeout mode. */
+                if (len > static_cast<uint64_t>(
+                        mClientWriteBuf->buffer_list.slice_count) *
+                        mClientWriteBuf->buffer_list.slice_size)
+                    return SHMIPC_ERR;
                 if (tryWriteOnce(data, len)) {
                 mBytesSent.fetch_add(len, std::memory_order_relaxed);
                 mMsgsSent .fetch_add(1,   std::memory_order_relaxed);
@@ -458,9 +485,13 @@ void ShmClientSession::notifyServerOfClientWrite() {
 
 void ShmClientSession::serverWriteConsumerThread() {
     LOGI("ShmClientSession server_write consumer start");
-    auto* flags = &mServerWriteBuf->io_queue.workingFlags;
 
     while (mConsumerRunning.load(std::memory_order_acquire)) {
+        /* Fix C: re-read mServerWriteBuf each iteration so that if
+         * cleanupSharedMemory() nulls it (under mWriteMutex) we exit
+         * cleanly instead of dereferencing a dangling pointer. */
+        if (!mServerWriteBuf) break;
+        auto* flags = &mServerWriteBuf->io_queue.workingFlags;
         uint32_t val = flags->load(std::memory_order_acquire);
         if (val == 0) {
             /* Sleep until server calls shm_futex_wake, or 10 ms elapses
@@ -553,6 +584,11 @@ shmipc_wbuf_t* ShmClientSession::allocWriteBuf(uint32_t len) {
         wb->manager    = mClientWriteBuf;
         return wb;
     }
+
+    /* Fix A: bound len against total pool capacity to prevent integer
+     * overflow in slices_needed = (len + slice_size - 1) / slice_size. */
+    if (len > static_cast<uint64_t>(list->slice_count) * list->slice_size)
+        return nullptr;
 
     uint32_t slices_needed = (len + slice_size - 1) / slice_size;
     uint32_t first = INVALID_INDEX, prev = INVALID_INDEX, offset = 0;

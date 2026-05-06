@@ -22,6 +22,10 @@
  * and is set by init_shm_buffer_manager(). */
 #define SHMIPC_MAX_EVENT_QUEUE_SIZE     512
 
+/* Upper bound on total shared memory size to prevent a malicious
+ * peer from forcing the host to mmap an unreasonable amount of memory. */
+#define SHMIPC_MAX_SHM_SIZE             (256u * 1024u * 1024u)  // 256 MB
+
 /* ---- Preset: LOW_FREQ  (control messages, < 100/s) ---- */
 #define SHMIPC_PRESET_LOW_FREQ_SHM_SIZE          ( 8u * 1024u * 1024u)  //  8 MB total
 #define SHMIPC_PRESET_LOW_FREQ_EVENT_QUEUE_CAP   32u

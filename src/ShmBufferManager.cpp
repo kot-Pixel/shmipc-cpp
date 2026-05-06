@@ -74,7 +74,43 @@ ShmBufferManager* init_shm_buffer_manager(void*    addr,
     return mgr;
 }
 
-ShmBufferManager* attach_shm_buffer_manager(void* addr) {
+ShmBufferManager* attach_shm_buffer_manager(void* addr, size_t region_size) {
     if (!addr) return nullptr;
-    return static_cast<ShmBufferManager*>(addr);
+    auto* mgr = static_cast<ShmBufferManager*>(addr);
+
+    /* Validate event-queue capacity (protects against division-by-zero
+     * and out-of-bounds access to the statically-sized events[] array). */
+    if (mgr->io_queue.capacity == 0 ||
+        mgr->io_queue.capacity > SHMIPC_MAX_EVENT_QUEUE_SIZE) {
+        LOGE("attach_shm_buffer_manager: invalid capacity=%u (max=%u)",
+             mgr->io_queue.capacity, SHMIPC_MAX_EVENT_QUEUE_SIZE);
+        return nullptr;
+    }
+
+    /* Validate slice parameters for self-consistency. */
+    if (mgr->buffer_list.slice_count == 0 ||
+        mgr->buffer_list.slice_size  == 0) {
+        LOGE("attach_shm_buffer_manager: slice_count=%u slice_size=%u",
+             mgr->buffer_list.slice_count, mgr->buffer_list.slice_size);
+        return nullptr;
+    }
+    if (mgr->buffer_list.stride != SLICE_HEADER_SZ + mgr->buffer_list.slice_size) {
+        LOGE("attach_shm_buffer_manager: stride mismatch (%u != %u + %u)",
+             mgr->buffer_list.stride, SLICE_HEADER_SZ,
+             mgr->buffer_list.slice_size);
+        return nullptr;
+    }
+
+    /* Verify the total footprint fits within the mapped region. */
+    uint64_t total = static_cast<uint64_t>(sizeof(ShmBufferManager))
+                   + static_cast<uint64_t>(mgr->buffer_list.slice_count)
+                   * static_cast<uint64_t>(mgr->buffer_list.stride);
+    if (total > region_size) {
+        LOGE("attach_shm_buffer_manager: region overflow "
+             "(need %llu, have %zu)",
+             (unsigned long long)total, region_size);
+        return nullptr;
+    }
+
+    return mgr;
 }

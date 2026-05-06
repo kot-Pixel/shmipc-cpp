@@ -83,6 +83,15 @@ bool ShmProtocolHandler::receiveProtocolPayload(int fd, char* buf, size_t len)
 
 int ShmProtocolHandler::sendShmMessage(int socketFd, const ShmIpcMessage& message)
 {
+    /* Guard: the control-message buffer on the stack is sized for
+     * SHM_SERVER_MAX_UDS_PROTOCOL_FD fds.  A larger fd vector would
+     * cause a stack buffer overflow when the kernel writes SCM_RIGHTS. */
+    if (message.fds.size() > SHM_SERVER_MAX_UDS_PROTOCOL_FD) {
+        LOGE("sendShmMessage: too many fds (%zu, max %u)",
+             message.fds.size(), SHM_SERVER_MAX_UDS_PROTOCOL_FD);
+        return -1;
+    }
+
     struct msghdr msg{};
     struct iovec iov[2];
 

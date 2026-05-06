@@ -79,6 +79,23 @@ void ShmServer::acceptLoop() {
             continue;
         }
 
+        /* Fix #6: authenticate the peer via SO_PEERCRED.
+         * Reject connections from other users on multi-user systems.
+         * root (uid=0) is allowed for debugging / admin tooling. */
+        {
+            struct ucred cred;
+            socklen_t cred_len = sizeof(cred);
+            if (getsockopt(clientFd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == 0) {
+                uid_t my_uid = getuid();
+                if (cred.uid != 0 && cred.uid != my_uid) {
+                    LOGE("peer uid=%u rejected (server uid=%u) fd=%d",
+                         cred.uid, my_uid, clientFd);
+                    close(clientFd);
+                    continue;
+                }
+            }
+        }
+
         LOGI("new client fd=%d", clientFd);
         /* onConnected is fired later, inside ShmServerSession::onSharedMemoryReady(),
          * once the full SHM handshake has completed and both buffers are ready. */

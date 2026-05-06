@@ -2,6 +2,7 @@
 #define SHMIPC_SHMMETADATA_H
 
 #include <cstdint>
+#include "ShmConfig.h"
 
 constexpr uint32_t SHM_MAGIC   = 0x53484D49; // "SHMI"
 constexpr int8_t   SHM_VERSION = 1;
@@ -21,7 +22,9 @@ inline bool metaDataIsValid(const ShmMetadata& meta) {
     if (meta.magic   != SHM_MAGIC)   return false;
     if (meta.version  < SHM_VERSION)  return false;
     if (meta.shmSize == 0)            return false;
+    if (meta.shmSize > SHMIPC_MAX_SHM_SIZE) return false;
     if (meta.eventQueueCapacity == 0) return false;
+    if (meta.eventQueueCapacity > SHMIPC_MAX_EVENT_QUEUE_SIZE) return false;
     if (meta.sliceSize == 0)          return false;
     return true;
 }
