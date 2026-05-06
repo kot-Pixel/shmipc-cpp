@@ -9,6 +9,33 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — Critical
+
+- **Session handle UAF**: `onDisconnected` no longer deletes `shmipc_session_t*`.
+  Added `alive` flag; handle deletion deferred to `shmipc_server_destroy`.
+- **ABA race in free-list**: `ShmBufferList::free_head` widened to 64-bit
+  tagged pointer (tag:index); `free_slice` increments generation tag.
+- **Consumer thread TOCTOU**: `mServerWriteBuf`/`mClientWriteBuf` changed to
+  `std::atomic<ShmBufferManager*>` in both session classes.
+
+### Fixed — High
+
+- **Session latency/status APIs**: added missing `CLIENT_SIDE` branches to
+  `shmipc_session_get_latency`, `_reset_latency`, `_get_status`.
+- **`ShmClientSession::joinThreads()`**: removed undeclared declaration.
+
+### Fixed — Medium
+
+- **`ShmIpcMessageHeader`**: removed redundant `htonl`/`ntohl` double-swap.
+- **`ShmTestPacket`**: `data[0]` → `data[]` (flexible array member).
+- **`ShmBenchTester::seq`**: `uint32_t` → `std::atomic<uint32_t>`.
+- **`ShmMessageQueue`**: added `reset()` method.
+- **`goto done`**: replaced with `bool dropped` flag in consumer read loops.
+
+### Removed
+
+- **Tests**: `test8_boundary`, `test9_concurrent`, `test10_api`, `bench_test`.
+
 ---
 
 ## [1.1.0] - 2026-04-30
@@ -26,7 +53,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   *after* `munmap`, leaving a window where a concurrent write thread could
   dereference the already-unmapped region.  `sendWriteBuf`, `discardWriteBuf`,
   and `allocWriteBuf` also accessed SHM without holding the write mutex, so they
-  could race with cleanup.  Fix: acquire `mWriteMutex` inside
+  could race
+ with cleanup.  Fix: acquire `mWriteMutex` inside
   `cleanupSharedMemory()` before zeroing the pointers, and move all SHM
   accesses in `sendWriteBuf` / `discardWriteBuf` / `allocWriteBuf` under the
   same mutex with a validity check (`buf->manager == mClientWriteBuf`).
@@ -58,7 +86,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`ShmBufferManager.h`): `event.length` comes from shared memory and is
   peer-controlled.  A corrupt or malicious sender could set it to `0xFFFFFFFF`,
   causing `new uint8_t[~4 GB]` to throw `std::bad_alloc`.  Fix: validate
-  `total_len` against `slice_count × slice_size` (the pool maximum); on
+  `total_len` against `slice_count * slice_size` (the pool maximum); on
   failure, free the slice chain and return `nullptr` so the consumer skips the
   event cleanly.
 
@@ -78,7 +106,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   internal `onDisconnected` handler in `shmipc_server_create()` that always
   frees the `apiHandle`; `destroy()` no longer needs its own cleanup loop.
 
-- **Payload-length integer underflow → OOM** (`ShmClientSession::readerThread`,
+- **Payload-length integer underflow -> OOM** (`ShmClientSession::readerThread`,
   `ShmServerSession::clientUdsReader`): `payloadLen = header.length -
   SHM_SERVER_PROTOCOL_HEAD_SIZE` is an unsigned subtraction.  When a malformed
   (or truncated) message arrives with `length < 7`, the result wraps to ~4 GB
@@ -115,7 +143,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Handler::sendShmMessage`): writing to a closed peer socket delivered
   `SIGPIPE` to the process, whose default action is termination.  Fix: pass
   `MSG_NOSIGNAL` to all `sendmsg` calls, and handle `EPIPE` / `ECONNRESET`
-  gracefully.  Also added a 100 µs back-off on `EAGAIN` to avoid a hot
+  gracefully.  Also added a 100 us back-off on `EAGAIN` to avoid a hot
   busy-loop.
 
 - **SCM_RIGHTS file-descriptor could be lost across partial `recvmsg` reads**
@@ -158,7 +186,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`install.sh`: dynamic NDK host detection**: the `llvm-strip` path was
   hard-coded to `linux-x86_64`.  It now detects the host OS and architecture
-  with `uname`, and maps `darwin-arm64` → `darwin-x86_64` (Apple Silicon uses
+  with `uname`, and maps `darwin-arm64` -> `darwin-x86_64` (Apple Silicon uses
   the Rosetta NDK toolchain).
 
 ### Fixed — Tests
@@ -186,8 +214,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed — Documentation
 
-- **`README.md` Notes section**: fixed Markdown syntax (`` `**xxx` `` mixed
-  code/bold markers corrected to `**\`xxx\`**`).
+- **`README.md` Notes section**: fixed Markdown syntax.
 
 - **Zero-copy receive examples**: added a **client-side** `on_data_zc` snippet
   to both READMEs.  The client callback type is `shmipc_cli_on_data_zc_cb`
@@ -212,7 +239,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Zero-copy receive (`on_data_zc`) and write-side zero-copy (`alloc_buf` /
   `send_buf`) APIs.
 - Async dispatch: serial (preserves order) and concurrent thread-pool modes.
-- Latency histogram with nanosecond resolution (log₂ bucketing).
+- Latency histogram with nanosecond resolution (log2 bucketing).
 - Three configuration presets: `LOW_FREQ`, `GENERAL`, `HIGH_THROUGHPUT`.
 - Android arm64-v8a cross-compilation support via NDK CMake toolchain.
 - `install.sh` packaging script producing a `dist/` tree for each ABI.
